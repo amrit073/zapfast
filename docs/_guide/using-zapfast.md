@@ -6,6 +6,18 @@ redirect_from:
 nav_order: 3
 ---
 
+## Online and last seen
+
+Open a one-to-one conversation to see **online** or **last seen today at …**
+below the contact's name. The contact information dialog shows the same state.
+ZapFast refreshes presence when you open a conversation, including one already
+cached locally, and when the account reconnects.
+
+These details appear only when WhatsApp supplies them and the contact's privacy
+settings allow you to see them. ZapFast does not estimate last seen from messages
+or typing, and it keeps each account's presence separate. If nothing appears,
+check whether the same account can see that contact's last seen in WhatsApp.
+
 ## Writing
 
 Enter sends and Shift+Enter adds a line. Turn off **Enter sends** in Settings

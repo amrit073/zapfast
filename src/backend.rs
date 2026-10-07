@@ -235,6 +235,10 @@ pub enum Command {
         marked_at: i64,
         success: bool,
     },
+    /// Refreshes a direct contact's server-provided online and last-seen state.
+    SubscribePresence {
+        chat: ChatId,
+    },
     /// Loads archived chat messages before an optional boundary.
     LoadChat {
         chat: ChatId,

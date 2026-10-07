@@ -517,7 +517,6 @@ pub async fn run(
         group_info_queue: std::collections::VecDeque::new(),
         group_info_tries: HashMap::new(),
         group_info_retry: Vec::new(),
-        presence_subscribed: HashSet::new(),
         download_folder: None,
         keep_chats_archived: true,
         online_wanted: false,
@@ -819,7 +818,6 @@ struct Worker {
     group_info_tries: HashMap<String, u32>,
     /// Next retry time for failed group metadata requests.
     group_info_retry: Vec<(Instant, String)>,
-    presence_subscribed: HashSet<String>,
     /// Chosen folder for new downloads, when not the cache.
     download_folder: Option<PathBuf>,
     /// Settings' "Keep chats archived". Off, a new message unarchives its
@@ -2771,7 +2769,6 @@ impl Worker {
         self.group_info_queue.clear();
         self.group_info_tries.clear();
         self.group_info_retry.clear();
-        self.presence_subscribed.clear();
         self.read_sync = ReadSync::default();
         self.favorite_chats = Default::default();
         self.poll_sending.clear();
@@ -4642,6 +4639,7 @@ impl Worker {
                     self.pump_read_sync();
                 }
             }
+            Command::SubscribePresence { chat } => self.subscribe_presence(chat),
             Command::LoadChat { chat, before } => self.load_chat(chat, before),
             Command::FetchOlder { chat, explicit } => self.fetch_older(chat, explicit),
             Command::ReloadHistory { chat, message } => self.reload_history(chat, message),
@@ -6571,15 +6569,21 @@ impl Worker {
             // Force group metadata when opening a group.
             self.request_group_info(&chat, false);
         }
-        if before.is_none()
-            && ChatKind::from_id(&chat) == ChatKind::Direct
+    }
+
+    fn subscribe_presence(&self, chat: ChatId) {
+        // The protocol library tracks successful subscriptions and restores
+        // them after reconnecting. Refresh when opening even a cached chat:
+        // a failed send (or an earlier attempt before connecting) must not
+        // permanently suppress future requests.
+        if ChatKind::from_id(&chat) == ChatKind::Direct
             && chat != self.me()
-            && self.presence_subscribed.insert(chat.clone())
+            && matches!(self.status, LinkStatus::Connected)
             && let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&chat))
         {
             tokio::spawn(async move {
-                if let Err(error) = client.presence().subscribe(jid).await {
-                    log::debug!("presence not subscribed: {error}");
+                if client.presence().subscribe(jid).await.is_err() {
+                    log::debug!("presence subscription failed; retry on opening or reconnecting");
                 }
             });
         }
@@ -11934,7 +11938,6 @@ mod receipt_tests {
             group_info_queue: std::collections::VecDeque::new(),
             group_info_tries: HashMap::new(),
             group_info_retry: Vec::new(),
-            presence_subscribed: HashSet::new(),
             download_folder: None,
             keep_chats_archived: true,
             online_wanted: false,

@@ -3486,6 +3486,9 @@ impl App {
     }
 
     fn ensure_loaded(&mut self, chat: &str) {
+        self.backend.send(Command::SubscribePresence {
+            chat: chat.to_owned(),
+        });
         let request = {
             let conversation = self.conversations.entry(chat.to_owned()).or_default();
             if conversation.requested {
@@ -9102,6 +9105,42 @@ mod tests {
             &egui::Context::default(),
         );
         assert!(app.chat("3@s.whatsapp.net").unwrap().pinned);
+    }
+
+    #[test]
+    fn cached_chat_presence_refreshes_on_reopening_and_reconnecting() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let chat = "15550100001@s.whatsapp.net";
+        app.open_chat = Some(chat.into());
+        app.ensure_loaded(chat);
+        assert!(
+            matches!(commands.try_recv().unwrap(), Command::SubscribePresence { chat: id } if id == chat)
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            Command::LoadChat { before: None, .. }
+        ));
+        // The archive page is cached, but a failed presence send must be retried.
+        app.ensure_loaded(chat);
+        assert!(
+            matches!(commands.try_recv().unwrap(), Command::SubscribePresence { chat: id } if id == chat)
+        );
+        assert!(commands.try_recv().is_err());
+        app.handle_link(
+            LinkStatus::Disconnected {
+                reason: "fixture".into(),
+            },
+            true,
+        );
+        app.handle_link(LinkStatus::Connected, true);
+        let refreshed = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter(
+                |command| matches!(command, Command::SubscribePresence { chat: id } if id == chat),
+            )
+            .count();
+        assert_eq!(refreshed, 1);
     }
 
     #[test]

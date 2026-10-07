@@ -896,6 +896,13 @@ pub fn populate(app: &mut App) {
             last_seen: None,
         },
     );
+    app.presence.insert(
+        SAMPLES[2].id.to_owned(),
+        Presence {
+            online: false,
+            last_seen: Some(crate::util::now() - 300),
+        },
+    );
     app.open_chat = Some(ada.to_owned());
     // Mark the open chat as read.
     if let Some(chat) = app.chats.iter_mut().find(|chat| chat.id == ada) {
@@ -1713,6 +1720,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
     for part in page.split(',').map(str::trim) {
         match part {
             "chat" | "" => {}
+            "last-seen" => app.open_chat = Some(SAMPLES[2].id.to_owned()),
             "call-incoming" | "call-outgoing" | "call-active" | "call-muted" => {
                 use crate::model::{ActiveCall, CallPhase};
                 app.call = Some(ActiveCall {
@@ -4335,6 +4343,7 @@ mod tests {
             "sticker-pack-message",
             "sticker-maker",
             "sticker-pack-view",
+            "last-seen",
             "typing",
             "composer-tools",
             "mention",
