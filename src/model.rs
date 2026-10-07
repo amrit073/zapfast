@@ -11,6 +11,28 @@ use serde::{Deserialize, Serialize};
 /// Chat JID string: `<phone>@s.whatsapp.net`, `<id>@g.us`, or `<id>@lid`.
 pub type ChatId = String;
 
+/// The native client's call state, independent of protocol types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallPhase {
+    Incoming,
+    Outgoing,
+    Ringing,
+    Connecting,
+    Active,
+    Ending,
+}
+
+/// One call across all accounts. Controls always retain its account and id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveCall {
+    pub account_id: AccountId,
+    pub id: String,
+    pub peer: ChatId,
+    pub name: String,
+    pub phase: CallPhase,
+    pub muted: bool,
+}
+
 /// Stable folder name for a linked WhatsApp account on this computer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AccountId(pub String);
@@ -1299,6 +1321,24 @@ pub enum Scroll {
 /// Actions queued by views and applied after drawing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
+    StartCall(ChatId),
+    AcceptCall {
+        account_id: AccountId,
+        call_id: String,
+    },
+    DeclineCall {
+        account_id: AccountId,
+        call_id: String,
+    },
+    HangUpCall {
+        account_id: AccountId,
+        call_id: String,
+    },
+    SetCallMuted {
+        account_id: AccountId,
+        call_id: String,
+        muted: bool,
+    },
     Open(Page),
     /// Opens settings, or closes them when they are already showing.
     ToggleSettings,

@@ -35,5 +35,11 @@ CDN when you import a Signal sticker pack. It has no telemetry. It also asks
 `api.github.com` once a day whether a newer release exists; you can turn this
 off in Settings. Downloading an update fetches release files from GitHub.
 
+One-to-one voice calls use whatsapp-rust for WhatsApp call signaling,
+encryption, and UDP audio transport. Calls open the default microphone and
+speakers when you start or answer a call; ZapFast does not save the audio. Calling is disabled
+when a proxy is configured because its UDP transport cannot use the app's
+current proxy support.
+
 Unlinking from Settings tells the phone to forget the device and deletes
 the local archive and caches.

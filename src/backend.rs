@@ -123,6 +123,33 @@ pub struct CreatedPoll {
 
 #[derive(Debug)]
 pub enum Command {
+    StartCall {
+        id: String,
+        chat: ChatId,
+    },
+    IgnoreCall {
+        id: String,
+    },
+    AcceptCall {
+        id: String,
+    },
+    EndCall {
+        id: String,
+    },
+    MuteCall {
+        id: String,
+        muted: bool,
+    },
+    /// Session-task callbacks retain their local identity across reconnects.
+    CallUpdate {
+        id: String,
+        phase: crate::model::CallPhase,
+        muted: bool,
+    },
+    CallFinished {
+        id: String,
+        reason: String,
+    },
     RefreshPoll {
         chat: ChatId,
         message: String,
@@ -746,6 +773,16 @@ pub enum Command {
 
 #[derive(Debug)]
 pub enum Event {
+    Call {
+        id: String,
+        peer: ChatId,
+        phase: crate::model::CallPhase,
+        muted: bool,
+    },
+    CallEnded {
+        id: String,
+        reason: String,
+    },
     InteractiveReplyState {
         chat: ChatId,
         message: String,

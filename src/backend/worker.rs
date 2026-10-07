@@ -36,6 +36,7 @@ use whatsapp_rust::waproto::buffa::Message as _;
 use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
 
 mod bot_replies;
+mod calls;
 mod channel_pictures;
 mod contact_names;
 mod device_store;
@@ -478,6 +479,7 @@ pub async fn run(
                 .set_meta(contact_names::FIRST_NAMES_RECOVERED, "complete")
                 .is_ok());
     let mut worker = Worker {
+        call: None,
         privacy_ready: privacy_confirmed,
         privacy_confirmed,
         privacy_snapshot,
@@ -604,6 +606,7 @@ pub async fn run(
                 worker.refresh_legacy_preferences();
                 worker.expire_older_requests();
                 worker.retry_avatars();
+                worker.pump_calls();
                 worker.pump_group_info();
                 worker.pump_favorite_stickers();
                 worker.pump_read_sync();
@@ -744,6 +747,7 @@ fn message_removal_outcome(
 }
 
 struct Worker {
+    call: Option<calls::Session>,
     /// Private content may reach the UI.
     privacy_ready: bool,
     /// Phone lock state is known to be mirrored in the archive.
@@ -1864,6 +1868,8 @@ impl Worker {
     }
 
     async fn stop_bot(&mut self) {
+        self.stop_call_for_disconnect("Call ended: connection closed")
+            .await;
         self.client = None;
         // A batch still going belongs to the session that was sending it, and
         // every send is its own task: one can report its tick after this
@@ -2317,6 +2323,8 @@ impl Worker {
     async fn handle_wa_event(&mut self, event: Arc<wa_events::Event>) {
         use wa_events::Event as E;
         match &*event {
+            E::IncomingCall(incoming) => self.incoming_call(incoming).await,
+            E::CallEndedElsewhere(ended) => self.call_ended_elsewhere(&ended.call_id).await,
             E::PairingQrCode(qr) => {
                 self.qr = Some(qr.code.clone());
                 let status = self.unlinked();
@@ -2434,6 +2442,8 @@ impl Worker {
                 }
             }
             E::Disconnected(disconnected) => {
+                self.stop_call_for_disconnect("Call ended: disconnected")
+                    .await;
                 if matches!(self.status, LinkStatus::Connected | LinkStatus::Connecting) {
                     self.set_status(LinkStatus::Disconnected {
                         reason: disconnected.reason.to_string(),
@@ -4505,6 +4515,13 @@ impl Worker {
             }
         }
         match command {
+            Command::StartCall { id, chat } => self.start_call(id, chat),
+            Command::IgnoreCall { id } => self.ignore_call(&id),
+            Command::AcceptCall { id } => self.accept_call(&id),
+            Command::EndCall { id } => self.end_call(&id).await,
+            Command::MuteCall { id, muted } => self.mute_call(&id, muted),
+            Command::CallUpdate { id, phase, muted } => self.call_update(&id, phase, muted),
+            Command::CallFinished { id, reason } => self.call_finished(&id, reason),
             Command::RefreshPoll { chat, message } => self.refresh_poll(chat, message),
             Command::PollHistoryFailed {
                 chat,
@@ -11879,6 +11896,7 @@ mod receipt_tests {
         let root =
             std::env::temp_dir().join(format!("zapfast-worker-test-{}-{n}", std::process::id()));
         let worker = Worker {
+            call: None,
             privacy_ready: true,
             privacy_confirmed: true,
             privacy_snapshot: false,

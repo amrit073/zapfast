@@ -22,6 +22,8 @@ use crate::settings::{AccountRoster, NotificationSound, Settings, ThemeChoice};
 use crate::single_instance::{ControlCommand, Guard};
 use crate::theme::{self, Palette};
 
+mod calls;
+
 /// Initial and incremental message-page size.
 pub const PAGE: usize = 60;
 /// Minimum delay between phone history requests.
@@ -344,6 +346,9 @@ pub struct UnreadDivider {
 }
 
 pub struct App {
+    /// Calls belong to the process, not the currently visible account.
+    pub call: Option<crate::model::ActiveCall>,
+    call_opens: std::sync::Arc<std::sync::Mutex<Vec<crate::notify::NotificationTarget>>>,
     pub dirs: AppDirs,
     pub settings: Settings,
     /// Resolved interface language, from the setting or the system locale.
@@ -980,6 +985,8 @@ impl App {
         let app_lock = crate::app_lock::AppLock::new(settings.app_lock_hash.is_some());
         let tray_lockable = settings.app_lock_hash.is_some();
         let mut app = Self {
+            call: None,
+            call_opens: Default::default(),
             dirs,
             settings,
             locale,
@@ -1331,6 +1338,9 @@ impl App {
     /// folders. The last account is only unlinked: the window always shows
     /// one, even if it is waiting to be linked.
     fn remove_account(&mut self, id: AccountId) {
+        if self.call.as_ref().is_some_and(|call| call.account_id == id) {
+            self.stop_call();
+        }
         let Some(index) = self.accounts.iter().position(|account| account.id == id) else {
             return;
         };
@@ -1488,6 +1498,7 @@ impl App {
     /// window when needed. The click carries the message, so the reader lands
     /// on what the notification showed, not on the end of the chat.
     fn handle_notification_opens(&mut self) {
+        self.handle_call_opens();
         let opened: Vec<crate::notify::NotificationTarget> = std::mem::take(
             &mut *self
                 .notification_opens
@@ -2422,6 +2433,13 @@ impl App {
 
     fn apply_backend_event(&mut self, event: Event, live: bool) {
         match event {
+            Event::Call {
+                id,
+                peer,
+                phase,
+                muted,
+            } => self.handle_call(id, peer, phase, muted),
+            Event::CallEnded { id, reason } => self.handle_call_ended(&id, &reason),
             Event::Link(status) => self.handle_link(status, live),
             Event::Me {
                 id,
@@ -2456,6 +2474,9 @@ impl App {
             }
             Event::Chats(chats) => {
                 for chat in &chats {
+                    if chat.locked {
+                        self.redact_call_peer(&chat.id);
+                    }
                     if chat.unread == 0 {
                         self.clear_chat_notifications(&chat.id);
                     }
@@ -2986,6 +3007,14 @@ impl App {
     }
 
     fn handle_link(&mut self, status: LinkStatus, live: bool) {
+        if !status.is_connected()
+            && self
+                .call
+                .as_ref()
+                .is_some_and(|call| call.account_id == self.account().id)
+        {
+            self.stop_call();
+        }
         match &status {
             LinkStatus::Connected => {
                 for conversation in self.conversations.values_mut() {
@@ -3046,6 +3075,9 @@ impl App {
     }
 
     fn handle_chat_updated(&mut self, chat: Chat, live: bool) {
+        if chat.locked {
+            self.redact_call_peer(&chat.id);
+        }
         // A hidden account's remembered chat is not being read: marking it
         // read would send receipts for messages nobody has seen.
         let remembered = self.open_chat.as_deref() == Some(chat.id.as_str());
@@ -4110,6 +4142,21 @@ impl App {
     }
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
+        if self.call.is_some()
+            && matches!(
+                action,
+                Action::StartRecording
+                    | Action::PlayVoice { .. }
+                    | Action::SeekVoice { .. }
+                    | Action::PlayVideo { .. }
+                    | Action::PlayVideoWhenDownloaded(_)
+                    | Action::ExpandVideo { .. }
+                    | Action::SeekVideo { .. }
+                    | Action::ToggleVideoSound
+            )
+        {
+            return;
+        }
         if self.app_lock.is_locked() && !allowed_while_locked(&action) {
             // A clicked notification opens its message once unlocked; the
             // rest would show or change what the lock hides.
@@ -4123,6 +4170,28 @@ impl App {
             return;
         }
         match action {
+            Action::StartCall(chat) => self.start_call(chat),
+            Action::AcceptCall {
+                account_id,
+                call_id,
+            } => self.accept_call(&account_id, &call_id),
+            Action::DeclineCall {
+                account_id,
+                call_id,
+            }
+            | Action::HangUpCall {
+                account_id,
+                call_id,
+            } => {
+                if self.matches_call(&account_id, &call_id) {
+                    self.stop_call();
+                }
+            }
+            Action::SetCallMuted {
+                account_id,
+                call_id,
+                muted,
+            } => self.mute_call(&account_id, &call_id, muted),
             Action::Open(page) => {
                 let opens_chats = page == Page::Chats;
                 // Privacy can change on the phone at any time, and nothing
@@ -5602,6 +5671,7 @@ impl App {
                     return;
                 }
                 self.settings.proxy = value.clone();
+                self.stop_call();
                 self.mark_settings_dirty();
                 crate::proxy::configure(&value);
                 for account in &self.accounts {
@@ -5917,6 +5987,7 @@ impl App {
             return;
         }
         self.app_lock.lock();
+        self.stop_call();
         self.window_focused = false;
         self.flush_open_draft();
         self.recording = None;

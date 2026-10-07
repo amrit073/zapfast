@@ -247,6 +247,35 @@ single choice. Click an answer to vote, and click it again to take the vote
 back. Creating polls in chats with disappearing messages is not supported
 yet.
 
+## Voice calls
+
+In a one-to-one chat, choose the phone button in the header to start a voice
+call. Incoming calls show **Accept** and **Decline**. The call controls stay
+above your chats when you switch chats, open Settings, or switch accounts;
+they name the account receiving or making the call. Choose **Mute** to stop
+sending microphone audio, **Unmute** to resume, and **Hang up** to end the call.
+ZapFast permits one call at a time across all linked accounts.
+Voice-message recording and message audio/video playback are unavailable during
+a call. Calls from locked chats use a generic caller label and do not show a
+desktop notification.
+
+Unlock ZapFast before answering a call. Locking the app ends an active call.
+Calls can continue while the window is hidden if ZapFast is still running in
+the tray. Quitting the app ends the call.
+
+Calls use your system's default microphone and speakers when the call starts.
+Allow microphone access if your operating system asks. Restart the call after
+changing audio devices. There is no echo cancellation yet, so use headphones
+to keep speaker audio out of the microphone. Call audio is streamed
+through WhatsApp and is not saved in your message archive. Video calls, group
+calls, call links, and screen sharing are not implemented yet.
+
+Calling is unavailable when a proxy is configured, including through the
+environment. Call audio uses UDP, which the current proxy support cannot
+route. ZapFast does not bypass your proxy to make a call.
+Cancelling or timing out an outgoing call during initial connection setup may
+briefly reconnect WhatsApp so the protocol library can clear that attempt.
+
 ## Voice messages
 
 Voice messages play in the chat with a seekable waveform. The chip beside the

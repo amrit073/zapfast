@@ -32,6 +32,9 @@ RAM, compared with 1.13 GB for WhatsApp Web and its Chromium processes.
   GIFs, and animated stickers play in place. H.264 videos in MP4 files play
   after downloading to the local cache; other formats open in your system
   player. [Download limits and playback controls](/using-zapfast/#videos-and-photos).
+- **Makes voice calls.** Start or answer one-to-one calls, mute your microphone,
+  and keep talking while switching chats or accounts.
+  [Call controls and limitations](/using-zapfast/#voice-calls).
 - **Uses interactive messages.** Business templates show their text, images,
   and options. Reply buttons and simple lists send the selected response with
   a quote, web links open in your browser, and copy-code buttons use the clipboard. [See examples and limitations](/using-zapfast/#interactive-messages).
@@ -57,7 +60,8 @@ Feature requests can be discussed within the project's
 [product boundaries](https://github.com/crmne/zapfast/blob/main/CONTRIBUTING.md#before-opening-an-issue).
 ZapFast does not currently support:
 
-- Calls, status posts, communities, publishing to channels, and group
+- Video and group calls, call links, screen sharing, status posts, communities,
+  publishing to channels, and group
   administration beyond a group's name and photo (members, admins,
   descriptions, settings).
 - Playing videos outside the supported H.264 MP4 format in the app; they open

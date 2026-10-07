@@ -9,6 +9,10 @@ pub enum Stop {
     Send,
     Attach,
     Emoji,
+    CallStart,
+    CallAccept,
+    CallMute,
+    CallEnd,
     /// The chat header's Search, then the search pane's controls in reading
     /// order. The arrows walk its results from the field.
     ChatSearch,

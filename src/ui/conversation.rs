@@ -141,8 +141,10 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                 }
                 let picture = app.avatar(&chat.id);
                 let (subtitle, color) = subtitle(app, chat);
-                // More and Search, and Back in a narrow window.
-                let right_controls = if narrow { 108.0 } else { 72.0 };
+                // More, Search, a direct chat's call button, and narrow Back.
+                let direct = chat.kind == crate::model::ChatKind::Direct;
+                let right_controls =
+                    if narrow { 108.0 } else { 72.0 } + if direct { 36.0 } else { 0.0 };
                 // Treat the avatar, name, and subtitle as one info button.
                 let block = ui
                     .scope(|ui| {
@@ -362,6 +364,26 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                             Action::CloseChatSearch
                         } else {
                             Action::OpenChatSearch
+                        });
+                    }
+                    if direct {
+                        ui.add_enabled_ui(app.can_start_call(chat), |ui| {
+                            if theme::icon_button(
+                                ui,
+                                Icon::Phone,
+                                18.0,
+                                palette.secondary,
+                                palette.text,
+                                "Start voice call",
+                            )
+                            .on_disabled_hover_text(
+                                "Calls need a WhatsApp connection and no other active call. Calling is unavailable with a proxy because its audio uses UDP.",
+                            )
+                            .tab_stop(Stop::CallStart)
+                            .clicked()
+                            {
+                                app.actions.push(Action::StartCall(chat.id.clone()));
+                            }
                         });
                     }
                     // A narrow window shows the list or the chat, not both;

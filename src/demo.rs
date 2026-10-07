@@ -1713,6 +1713,21 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
     for part in page.split(',').map(str::trim) {
         match part {
             "chat" | "" => {}
+            "call-incoming" | "call-outgoing" | "call-active" | "call-muted" => {
+                use crate::model::{ActiveCall, CallPhase};
+                app.call = Some(ActiveCall {
+                    account_id: app.account().id.clone(),
+                    id: "demo-call".into(),
+                    peer: SAMPLES[0].id.into(),
+                    name: SAMPLES[0].name.into(),
+                    phase: match part {
+                        "call-incoming" => CallPhase::Incoming,
+                        "call-outgoing" => CallPhase::Outgoing,
+                        _ => CallPhase::Active,
+                    },
+                    muted: part == "call-muted",
+                });
+            }
             "chat-menu" => app.open_chat_menu = Some(app.chats[0].id.clone()),
             "chat-header-menu" => app.open_header_menu = app.open_chat.clone(),
             "interactive-actions" => interactive_actions_sample(app),
@@ -4202,6 +4217,10 @@ mod tests {
         }
         for page in [
             "chat-menu",
+            "call-incoming",
+            "call-outgoing",
+            "call-active",
+            "call-muted",
             "chat-header-menu",
             "channel",
             "meta-ai",
@@ -10704,9 +10723,18 @@ mod tests {
                         Stop::Send,
                         Stop::Attach,
                         Stop::Emoji,
+                        Stop::CallStart,
                         Stop::ChatSearch,
                         Stop::Sidebar
                     ]
+                    .into_iter()
+                    .filter(|stop| {
+                        *stop != Stop::CallStart
+                            || app
+                                .current_chat()
+                                .is_some_and(|chat| app.can_start_call(chat))
+                    })
+                    .collect::<Vec<_>>()
                 );
             }
             for backwards in [false, true] {

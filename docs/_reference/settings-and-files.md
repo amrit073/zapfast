@@ -149,6 +149,8 @@ name or description, in the interface language or in English.
   `http://host:port`, each with an optional `user:password@`; a bare
   `host:port` is an HTTP proxy. Changing it reconnects at once. Empty uses
   `ALL_PROXY` or `HTTPS_PROXY` from the environment and honors `NO_PROXY`.
+  Voice calls are disabled while a proxy is configured because call audio
+  uses UDP, which the current proxy support cannot route.
 - **GIPHY API key**: for GIF search, unless the build includes one. Set
   `ZAPFAST_GIPHY_KEY` at compile time to include a default key. The earlier
   `FASTSAPP_GIPHY_KEY` remains a fallback for existing builds.

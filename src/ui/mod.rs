@@ -1,6 +1,7 @@
 //! Window layout: panels, overlays, keyboard shortcuts.
 
 pub mod accounts;
+pub mod calls;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
@@ -59,6 +60,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // The open chat's composer records its rect again below, if there is one.
     ctx.data_mut(|data| data.remove::<egui::Rect>(composer_rect_id()));
     titlebar_strip(app, ui);
+    calls::show(app, ui);
     if !app.is_linked() {
         login::show(app, ui);
         accounts::corner(app, ctx);
