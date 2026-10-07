@@ -8394,8 +8394,11 @@ fn classify_base(base: &wa::Message) -> Option<Content> {
     {
         return unsupported("payment");
     }
-    if base.call_log_messsage.is_set() || base.scheduled_call_creation_message.is_set() {
-        return unsupported("call");
+    if base.call_log_messsage.is_set() {
+        return Some(Content::Call { scheduled: false });
+    }
+    if base.scheduled_call_creation_message.is_set() {
+        return Some(Content::Call { scheduled: true });
     }
     if base.lottie_sticker_message.is_set() {
         return unsupported("animated sticker");

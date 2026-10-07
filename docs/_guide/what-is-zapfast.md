@@ -57,7 +57,7 @@ Feature requests can be discussed within the project's
 [product boundaries](https://github.com/crmne/zapfast/blob/main/CONTRIBUTING.md#before-opening-an-issue).
 ZapFast does not currently support:
 
-- Calls, status posts, communities, publishing to channels, and group
+- Placing and receiving calls, status posts, communities, publishing to channels, and group
   administration beyond a group's name and photo (members, admins,
   descriptions, settings).
 - Playing videos outside the supported H.264 MP4 format in the app; they open

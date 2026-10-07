@@ -156,7 +156,7 @@ include its option labels, and find these messages through search.
 - **Copy-code buttons** copy the supplied code to your clipboard without sending
   a message.
 - **Unavailable options** have a phone icon and muted text. Forms, payments,
-  shopping flows, calls, and carousel choices need WhatsApp Web or your phone.
+  shopping flows, starting calls, and carousel choices need WhatsApp Web or your phone.
   Hover over an option to see its explanation. Unsupported or incomplete actions
   never send a guessed text response.
 
@@ -210,7 +210,7 @@ round previous/next arrows appear over the strip. Click an arrow or focus it and
 press Enter to move one card at a time. The arrows disappear at their respective
 ends; **Shift + mouse wheel** and horizontal touchpad scrolling remain available
 over the cards, without a bottom scrollbar. Image downloads follow your automatic-download
-setting. Web links and copy-code buttons work; calls and unsupported carousel
+setting. Web links and copy-code buttons work; starting calls and unsupported carousel
 reply actions remain unavailable.
 
 | Carousel cards | Poll result details |

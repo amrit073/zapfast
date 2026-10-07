@@ -4896,6 +4896,28 @@ fn content(
             );
             None
         }
+        Content::Call { scheduled } => {
+            let (title, detail) = if *scheduled {
+                ("Scheduled call", "Open WhatsApp on your phone to join it.")
+            } else {
+                ("Call", "Call details are shown on your phone.")
+            };
+            mirrored_row(
+                ui,
+                own,
+                |ui| {
+                    theme::icon(ui, Icon::Phone, 14.0, palette.dim);
+                },
+                |ui| {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        widgets::rich_text(ui, title, theme::medium(14.0), palette.text);
+                        widgets::rich_text(ui, detail, theme::regular(12.5), palette.secondary);
+                    });
+                },
+            );
+            None
+        }
         Content::Revoked => {
             mirrored_row(
                 ui,

@@ -491,6 +491,12 @@ pub enum Content {
         #[serde(default)]
         state: PollState,
     },
+    /// A call log or scheduled call entry shared by WhatsApp.
+    Call {
+        /// The call was scheduled, not completed or missed.
+        #[serde(default)]
+        scheduled: bool,
+    },
     /// "This message was deleted."
     Revoked,
     /// Unsupported content with a user-facing description.
@@ -774,6 +780,13 @@ impl Content {
             }
             Self::Contact { display_name, .. } => format!("Contact: {display_name}"),
             Self::Poll { question, .. } => format!("Poll: {question}"),
+            Self::Call { scheduled } => {
+                if *scheduled {
+                    "Scheduled call".to_owned()
+                } else {
+                    "Call".to_owned()
+                }
+            }
             Self::Revoked => "This message was deleted".to_owned(),
             Self::Unsupported { what } => format!("Unsupported message ({what})"),
             Self::PhoneOnly {
