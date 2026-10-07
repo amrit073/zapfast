@@ -1,0 +1,77 @@
+name: Linux artifacts
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build and packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev cmake perl libarchive-tools squashfs-tools
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+      - name: Install packaging tool
+        run: gem install native-packages --version 0.8.1 --no-document
+      - name: Build
+        env:
+          ZAPFAST_GIPHY_KEY: ${{ secrets.ZAPFAST_GIPHY_KEY || secrets.FASTSAPP_GIPHY_KEY }}
+        run: cargo build --release --locked
+      - name: Package portable archive
+        id: package
+        shell: bash
+        run: |
+          base=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          version="${base}-dev.${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:12}"
+          name="zapfast-v${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/$name" dist/artifacts
+          cp target/release/zapfast "dist/$name/"
+          cp README.md LICENSE THIRD-PARTY-NOTICES.md packaging/zapfast-portable.txt "dist/$name/"
+          cp --parents packaging/applications/zapfast.desktop packaging/icons/zapfast.svg contrib/omarchy/zapfast.json.tpl contrib/omarchy/zapfast-theme "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          cp "dist/$name.tar.gz" dist/artifacts/
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'Commit: %s\nBuild: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > dist/artifacts/BUILD.txt
+      - name: Build AppImage
+        env:
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          native-packages build --version "$VERSION" --target linux-amd64 --format appimage --defer-recipes --output dist/native
+          cp dist/native/packages/linux-amd64/appimage/*.AppImage dist/artifacts/
+      - name: Smoke test packages and record checksums
+        shell: bash
+        run: |
+          mkdir -p dist/smoke
+          tar -xzf dist/artifacts/*.tar.gz -C dist/smoke
+          binaries=(dist/smoke/*/zapfast)
+          "${binaries[0]}" --version
+          images=(dist/artifacts/*.AppImage)
+          "${images[0]}" --appimage-extract-and-run --version
+          cd dist/artifacts
+          sha256sum -- *.tar.gz *.AppImage > checksums.txt
+          sha256sum --check checksums.txt
+      - name: Upload Linux downloads
+        uses: actions/upload-artifact@v7
+        with:
+          name: zapfast-linux-x86_64-${{ github.sha }}
+          path: dist/artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

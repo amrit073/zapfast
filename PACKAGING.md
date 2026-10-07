@@ -126,3 +126,16 @@ disclosure of generated material. Review the manifests and these changes before
 submitting. The manifests use the current Freedesktop 26.08 runtime; the CI builder
 container is 25.08 and installs the runtime and SDK named by the manifest. The GitHub release job includes the bundle
 in `checksums.txt`. No existing release files are replaced by this change.
+
+## Development Linux artifacts
+
+The `Linux artifacts` workflow builds the current source on every push to `main`
+and supports manual runs from Actions. It uploads an x86_64 portable archive,
+an AppImage, `checksums.txt`, and a `BUILD.txt` identifying the commit and run.
+Downloads are kept for 30 days. These are development builds, separate from
+tagged releases and AUR publication.
+
+Both formats build on Ubuntu 24.04 and require glibc 2.39 or newer, including
+current Arch Linux. The workflow uses the pinned native-packages tool and
+configuration with `--defer-recipes`, then smoke-tests both executables with
+`--version`. This does not test the graphical interface or live calls.
