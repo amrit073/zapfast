@@ -83,17 +83,28 @@ impl Worker {
             {
                 return;
             }
-            if incoming.offline
-                || !matches!(self.status, LinkStatus::Connected)
-                || !self.privacy_ready
-                || self.call.is_some()
-                || *is_video
-                || group_jid.is_some()
-                || incoming.group.is_some()
-                || crate::proxy::for_whatsapp().is_some()
-            {
+            let ignored = if incoming.offline {
+                Some("offline offer")
+            } else if !matches!(self.status, LinkStatus::Connected) {
+                Some("account disconnected")
+            } else if !self.privacy_ready {
+                Some("privacy state not ready")
+            } else if self.call.is_some() {
+                Some("account already has a call")
+            } else if *is_video || group_jid.is_some() || incoming.group.is_some() {
+                Some("unsupported video or group call")
+            } else if crate::proxy::for_whatsapp().is_some() {
+                Some("proxy configured")
+            } else {
+                None
+            };
+            // Internal numeric account ids identify the runtime, never the caller.
+            let account = self.dirs.id.0.parse::<u64>().unwrap_or_default();
+            if let Some(reason) = ignored {
+                log::info!("call: account={account} incoming ignored: {reason}");
                 return;
             }
+            log::info!("call: account={account} incoming offered to interface");
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let id = format!(
                 "incoming-{}",
@@ -144,6 +155,7 @@ impl Worker {
         }) else {
             return;
         };
+        log::info!("call: resolved on another linked device");
         if session.task.is_none() {
             // The phone already resolved this offer. Never send a reject now.
             let id = session.id.clone();
@@ -176,6 +188,7 @@ impl Worker {
             self.ignore_call(id);
             return;
         }
+        log::info!("call: incoming accepted locally; opening audio");
         self.call_update(id, CallPhase::Connecting, false);
         self.launch_call();
     }
@@ -209,6 +222,7 @@ impl Worker {
                 abandoned_setup,
             )
             .await;
+            log::info!("call: session finished: {reason}");
             let _ = commands.send(Command::CallFinished { id, reason });
         }));
     }
@@ -240,6 +254,7 @@ impl Worker {
         let Some(mut session) = self.call.take() else {
             return;
         };
+        log::info!("call: local shutdown requested: {reason}");
         if let Some(control) = session.control.take() {
             let _ = control.send(Control::End);
         } else if let (Some(client), Some(offer)) = (&self.client, &session.offer) {
@@ -369,6 +384,7 @@ async fn run_call(
             }
         }
     };
+    log::info!("call: audio devices opened; starting protocol setup");
     audio.set_muted(true);
     let source = audio.source();
     let sink = audio.sink();
@@ -414,6 +430,7 @@ async fn run_call(
             }
         }
     };
+    log::info!("call: protocol setup completed; waiting for media");
     let events = handle.events();
     let mut accepted = offer.is_some();
     let mut relay = false;
@@ -438,16 +455,27 @@ async fn run_call(
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     while reason.is_none() {
         tokio::select! {
-            _ = handle.wait_ended() => reason = Some("Call ended"),
+            _ = handle.wait_ended() => reason = Some("Call media task ended"),
             _ = &mut timeout, if phase != CallPhase::Active => reason = Some("No answer or call connection timed out"),
             _ = tick.tick() => {
-                if audio.take_error().is_some() { reason = Some("The microphone or speaker stopped working"); }
+                if let Some(error) = audio.take_error() {
+                    log::warn!("call: audio device failure: {error}");
+                    reason = Some("The microphone or speaker stopped working");
+                }
                 if crate::proxy::for_whatsapp().is_some() { reason = Some("Call ended because a proxy was configured"); }
             }
             event = events.recv() => match event {
-                Ok(CallEvent::RelayAllocated) => relay = true,
-                Ok(CallEvent::RelayAllocateFailed(_) | CallEvent::RelayAllocateTimedOut | CallEvent::RelayReconnectTimedOut | CallEvent::MediaSetupFailed(_) | CallEvent::AudioFormatMismatch { .. }) => reason = Some("Could not connect call audio"),
-                Ok(CallEvent::Closed(_)) | Err(_) => reason = Some("Call ended"),
+                Ok(CallEvent::RelayAllocated) => {
+                    log::info!("call: relay allocated");
+                    relay = true;
+                },
+                Ok(CallEvent::RelayAllocateFailed(_)) => reason = Some("Call relay allocation failed"),
+                Ok(CallEvent::RelayAllocateTimedOut) => reason = Some("Call relay allocation timed out"),
+                Ok(CallEvent::RelayReconnectTimedOut) => reason = Some("Call relay reconnection timed out"),
+                Ok(CallEvent::MediaSetupFailed(_)) => reason = Some("Call media setup failed"),
+                Ok(CallEvent::AudioFormatMismatch { .. }) => reason = Some("Call audio formats do not match"),
+                Ok(CallEvent::Closed(_)) => reason = Some("Call media connection closed"),
+                Err(_) => reason = Some("Call event channel closed"),
                 _ => {}
             },
             command = control.recv() => match command {
@@ -464,6 +492,7 @@ async fn run_call(
             }
         }
         if accepted && relay && phase != CallPhase::Active && reason.is_none() {
+            log::info!("call: peer accepted and relay ready");
             phase = CallPhase::Active;
             muted = set_call_muted(&handle, &audio, muted).await;
             let _ = commands.send(Command::CallUpdate {

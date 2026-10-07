@@ -276,6 +276,17 @@ route. ZapFast does not bypass your proxy to make a call.
 Cancelling or timing out an outgoing call during initial connection setup may
 briefly reconnect WhatsApp so the protocol library can clear that attempt.
 
+### Troubleshooting calls
+
+On Linux, the current run's log is at
+`~/.local/state/zapfast/zapfast.log` (or `$XDG_STATE_HOME/zapfast/zapfast.log`
+when `XDG_STATE_HOME` is set). Save it before restarting,
+which replaces it. Call diagnostics identify incoming-offer filtering, whether
+the account was hidden, audio-device setup, and media-connection failures. They
+do not include caller identities, call identifiers, audio, or packet contents.
+Share only the relevant excerpt around an attempt. A decoder warning alone
+does not establish why a call disconnected.
+
 ## Voice messages
 
 Voice messages play in the chat with a seekable waveform. The chip beside the

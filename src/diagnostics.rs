@@ -8,7 +8,9 @@ use std::borrow::Cow;
 /// Nothing from `message` is copied into the summary except an HTTP status,
 /// which is rebuilt from its three digits: every other word is chosen here.
 pub fn protocol_summary(message: &str) -> Cow<'static, str> {
-    if message.contains("signature-mismatch") {
+    if let Some(summary) = call_summary(message) {
+        summary.into()
+    } else if message.contains("signature-mismatch") {
         "pairing signature verification failed".into()
     } else if message.contains("rate-overlimit") {
         "WhatsApp rate limit reached".into()
@@ -17,6 +19,38 @@ pub fn protocol_summary(message: &str) -> Cow<'static, str> {
     } else {
         "protocol diagnostic (private details omitted)".into()
     }
+}
+
+// Return only constants. Decoder diagnostics may contain arbitrary packet data.
+fn call_summary(message: &str) -> Option<&'static str> {
+    [
+        (
+            "mlow: failed to parse multiframe packet",
+            "call audio: invalid MLOW multiframe packet",
+        ),
+        (
+            "mlow: multiframe packet",
+            "call audio: invalid MLOW packet duration",
+        ),
+        (
+            "mlow: dropping out-of-operating-point frame",
+            "call audio: unsupported MLOW frame format",
+        ),
+        (
+            "mlow RED depacketization failed:",
+            "call audio: MLOW depacketization failed",
+        ),
+        (
+            "mlow: concealing malformed frame",
+            "call audio: concealed malformed MLOW frame",
+        ),
+        (
+            "mlow: range decoder raised its error flag",
+            "call audio: MLOW range decode error",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(prefix, summary)| message.starts_with(prefix).then_some(summary))
 }
 
 /// Names why a connection attempt failed, from the phrases whatsapp-rust and
@@ -281,6 +315,40 @@ mod tests {
             ),
             "timed out waiting for the WhatsApp handshake"
         );
+    }
+
+    #[test]
+    fn call_decoder_diagnostics_never_copy_private_payloads() {
+        for (prefix, expected) in [
+            (
+                "mlow: failed to parse multiframe packet",
+                "call audio: invalid MLOW multiframe packet",
+            ),
+            (
+                "mlow: multiframe packet",
+                "call audio: invalid MLOW packet duration",
+            ),
+            (
+                "mlow: dropping out-of-operating-point frame",
+                "call audio: unsupported MLOW frame format",
+            ),
+            (
+                "mlow RED depacketization failed:",
+                "call audio: MLOW depacketization failed",
+            ),
+            (
+                "mlow: concealing malformed frame",
+                "call audio: concealed malformed MLOW frame",
+            ),
+            (
+                "mlow: range decoder raised its error flag",
+                "call audio: MLOW range decode error",
+            ),
+        ] {
+            let message =
+                format!("{prefix} secret-key synthetic-message 15550000001@s.whatsapp.net");
+            assert_eq!(protocol_summary(&message), expected);
+        }
     }
 
     #[test]

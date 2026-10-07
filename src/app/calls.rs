@@ -131,9 +131,21 @@ impl App {
             return;
         }
         if phase != CallPhase::Incoming || self.call.is_some() || self.calls_use_proxy() {
+            log::info!(
+                "call: interface ignored event: incoming={}, occupied={}, proxy={}, hidden={}",
+                phase == CallPhase::Incoming,
+                self.call.is_some(),
+                self.calls_use_proxy(),
+                self.events_hidden
+            );
             self.backend.send(Command::IgnoreCall { id });
             return;
         }
+        log::info!(
+            "call: incoming bar shown; account_slot={}, hidden={}",
+            self.active + 1,
+            self.events_hidden
+        );
         let private = self.chat(&peer).is_some_and(|chat| chat.locked);
         let name = if private {
             "WhatsApp caller".into()
@@ -309,6 +321,37 @@ mod tests {
         );
         assert!(second_commands.try_recv().is_err());
         assert_eq!(app.active, 1);
+    }
+
+    #[test]
+    fn polling_hidden_account_shows_call_and_accepts_on_its_backend() {
+        let (_directory, mut app, mut primary_commands) = app();
+        let primary = app.account().id.clone();
+        let (mut secondary, _) =
+            crate::account::Account::detached(&app.dirs, AccountId("2".into()), Default::default())
+                .unwrap();
+        let secondary_id = secondary.id.clone();
+        let (backend, mut secondary_commands, events) = Backend::recording_with_events();
+        secondary.backend = backend;
+        secondary.link = LinkStatus::Connected;
+        app.accounts.push(secondary);
+        events
+            .send(Event::Call {
+                id: "hidden-call".into(),
+                peer: "15550000001@s.whatsapp.net".into(),
+                phase: CallPhase::Incoming,
+                muted: false,
+            })
+            .unwrap();
+        app.handle_events();
+        assert_eq!(app.account().id, primary);
+        assert!(!app.events_hidden);
+        assert_eq!(app.call.as_ref().unwrap().account_id, secondary_id);
+        app.accept_call(&secondary_id, "hidden-call");
+        assert!(
+            matches!(secondary_commands.try_recv(), Ok(Command::AcceptCall { id }) if id == "hidden-call")
+        );
+        assert!(primary_commands.try_recv().is_err());
     }
 
     #[test]
