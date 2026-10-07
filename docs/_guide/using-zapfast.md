@@ -417,8 +417,26 @@ it, and `Ctrl+B` brings the full list back.
 
 ## Notifications and the tray
 
-Closing the window keeps ZapFast linked in the tray. Click the tray icon or
-launch the app again to reopen it. Launchers that support the Unity Launcher API
+Closing the window keeps ZapFast linked when **Keep running when the window
+closes** is enabled and a tray host is available. Click the tray icon or
+launch the app again to reopen it. Without a tray host, closing quits the app
+and starting at login opens a window so it remains accessible.
+
+### Xfce
+
+ZapFast uses Linux StatusNotifier tray icons, supported by Xfce's built-in
+**Status Tray Plugin** in Xfce 4.16 and later. Right-click the panel, open
+**Panel → Panel Preferences → Items**, and add **Status Tray Plugin** if it
+is missing. Open its properties and make sure ZapFast is not marked hidden
+under **Status Notifiers**. The separate `xfce4-statusnotifier-plugin` is
+[deprecated because its functionality is built into the panel](https://docs.xfce.org/panel-plugins/xfce4-statusnotifier-plugin/start).
+Adding or restoring the tray while ZapFast is running should register the icon
+automatically. This does not require changing ZapFast's package or installing
+the deprecated plugin.
+
+### Badges and notifications
+
+Launchers that support the Unity Launcher API
 show the unread count as a badge on the app icon: KDE Plasma's taskbar, with
 **Show badges** enabled in the Task Manager settings, and GNOME's Dash to Dock
 or Dash to Panel. Windows overlays a compact unread-message count on ZapFast's
