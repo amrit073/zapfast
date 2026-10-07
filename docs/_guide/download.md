@@ -105,11 +105,12 @@ info**, then **Run anyway**.
 
 ## Personal Arch Linux build
 
-In this fork, open **Actions**, select **Arch Linux package**, and open a
-successful run on `main`. Download and extract the artifact at the bottom of
-the run page while signed in to GitHub. Downloads expire after 30 days.
+In this fork, open **Releases** and select the newest **Arch Linux build**
+prerelease. Under **Assets**, download the `.pkg.tar.zst` and `checksums.txt`
+into the same folder. Release downloads do not have the Actions artifact
+30-day expiry.
 
-On x86_64 Arch Linux, verify and install the package from the extracted folder:
+On x86_64 Arch Linux, verify and install the package from that folder:
 
 ```sh
 sha256sum --check checksums.txt

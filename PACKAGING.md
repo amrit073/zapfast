@@ -133,9 +133,13 @@ This fork keeps one Actions workflow, **Arch Linux package**, triggered by pushe
 to `main` or manually. It builds the locked Rust source on Ubuntu 24.04, then
 uses `makepkg` in an Arch Linux container to create an x86_64 `.pkg.tar.zst`.
 The recipe uses the existing binary-package template with the locally built
-archive, without publishing to AUR or creating a release.
+archive, without publishing to AUR. Successful builds from `main` also publish
+a personal GitHub prerelease containing the package, checksums, and build details.
+Each run gets its own `arch-build-<run-id>` tag, pointing to the built commit
+on `main`. Manual runs on other branches only upload Actions artifacts.
 
 The workflow installs the package in the disposable Arch container and checks
 `zapfast --version` and `pacman -Qk zapfast-bin`. Artifacts include the package,
-checksums, and commit information, retained for 30 days. GUI and live calls
+checksums, and commit information, retained for 30 days in Actions. Release
+downloads remain available until the release is deleted. GUI and live calls
 still require testing on a desktop.

@@ -65,3 +65,38 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+  publish:
+    name: Publish personal Arch download
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify commit is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - uses: actions/download-artifact@v8
+        with:
+          name: zapfast-arch-x86_64-${{ github.sha }}
+          path: dist/artifacts
+      - name: Verify package checksum
+        working-directory: dist/artifacts
+        run: sha256sum --check checksums.txt
+      - name: Publish download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="arch-build-${GITHUB_RUN_ID}"
+          title="Arch Linux build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:12})"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/artifacts/* --clobber
+          else
+            gh release create "$tag" dist/artifacts/* \
+              --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "$title" --notes-file packaging/arch/personal-release.md
+          fi
