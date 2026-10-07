@@ -8221,6 +8221,7 @@ dependencies = [
  "arboard",
  "async-channel",
  "base64 0.22.1",
+ "bytes",
  "cbc",
  "clap",
  "directories",

@@ -1,7 +1,7 @@
 //! One native voice session per account. The shell arbitrates across accounts.
 //! Protocol identifiers and offers stay on the runtime thread.
 use super::*;
-use crate::call_audio::CallAudio;
+use crate::call_audio::{CallAudio, OpusPorts};
 use crate::model::CallPhase;
 use whatsapp_rust::types::call::{CallAction, IncomingCall};
 use whatsapp_rust::voip::{CallEvent, CallHandle};
@@ -386,8 +386,11 @@ async fn run_call(
     };
     log::info!("call: audio devices opened; starting protocol setup");
     audio.set_muted(true);
-    let source = audio.source();
-    let sink = audio.sink();
+    let ports = match OpusPorts::new(&audio) {
+        Ok(ports) => ports,
+        Err(reason) => return reason,
+    };
+    log::info!("call: offering standard Opus audio");
     let mut setup_guard = SetupGuard {
         abandoned: abandoned_setup,
         armed: offer.is_none(),
@@ -397,12 +400,17 @@ async fn run_call(
             client
                 .voip()
                 .accept(offer)
-                .audio(source, sink)
+                .encoded_audio(OpusPorts::FORMAT, ports.source.clone(), ports.sink.clone())
                 .start()
                 .await
         } else {
             let jid: Jid = peer.parse().expect("validated call peer");
-            client.voip().call(&jid).audio(source, sink).start().await
+            client
+                .voip()
+                .call(&jid)
+                .encoded_audio(OpusPorts::FORMAT, ports.source.clone(), ports.sink.clone())
+                .start()
+                .await
         }
     };
     // Keep receiving controls during setup; cancellation drops upstream's registration guard.
@@ -458,7 +466,7 @@ async fn run_call(
             _ = handle.wait_ended() => reason = Some("Call media task ended"),
             _ = &mut timeout, if phase != CallPhase::Active => reason = Some("No answer or call connection timed out"),
             _ = tick.tick() => {
-                if let Some(error) = audio.take_error() {
+                if let Some(error) = audio.take_error().or_else(|| ports.take_error()) {
                     log::warn!("call: audio device failure: {error}");
                     reason = Some("The microphone or speaker stopped working");
                 }
@@ -473,6 +481,7 @@ async fn run_call(
                 Ok(CallEvent::RelayAllocateTimedOut) => reason = Some("Call relay allocation timed out"),
                 Ok(CallEvent::RelayReconnectTimedOut) => reason = Some("Call relay reconnection timed out"),
                 Ok(CallEvent::MediaSetupFailed(_)) => reason = Some("Call media setup failed"),
+                Ok(CallEvent::AudioCodecSourceIsFixed { .. }) => reason = Some("The peer changed to an unsupported call audio codec"),
                 Ok(CallEvent::AudioFormatMismatch { .. }) => reason = Some("Call audio formats do not match"),
                 Ok(CallEvent::Closed(_)) => reason = Some("Call media connection closed"),
                 Err(_) => reason = Some("Call event channel closed"),

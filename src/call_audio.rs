@@ -3,6 +3,9 @@
 //! Device streams belong to one thread, so stopping a call releases both devices
 //! without waiting for microphone samples. The adapters never touch the archive.
 
+mod opus;
+pub use opus::OpusPorts;
+
 use std::num::NonZero;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -66,10 +69,34 @@ impl CallAudio {
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("call-audio".into())
-            .spawn(move || match open_devices(capture_worker, rx, errors_tx) {
+            .spawn(move || match open_devices(Arc::clone(&capture_worker), rx, errors_tx.clone()) {
                 Ok((input, output)) => {
+                    let mut input = Some(input);
+                    let mut recovery = CaptureRecovery::default();
                     if ready_tx.send(Ok(())).is_ok() {
-                        let _ = stopped.recv();
+                        while let Err(mpsc::RecvTimeoutError::Timeout) =
+                            stopped.recv_timeout(Duration::from_millis(250))
+                        {
+                            let last = capture_worker.lock().unwrap_or_else(|p| p.into_inner()).last_input;
+                            match recovery.check(last.elapsed()) {
+                                CaptureHealth::Healthy => {},
+                                CaptureHealth::Reopen => {
+                                    log::warn!("call: microphone stalled; reopening default input once");
+                                    drop(input.take());
+                                    match open_input(Arc::clone(&capture_worker), errors_tx.clone()) {
+                                        Ok(reopened) => input = Some(reopened),
+                                        Err(error) => {
+                                            let _ = errors_tx.try_send(error);
+                                            break;
+                                        }
+                                    }
+                                },
+                                CaptureHealth::Failed => {
+                                    let _ = errors_tx.try_send("The call microphone stopped delivering audio after reopening".into());
+                                    break;
+                                },
+                            }
+                        }
                     }
                     drop(input);
                     drop(output);
@@ -111,11 +138,7 @@ impl CallAudio {
 
     /// The backend ends the owning call when a device reports a failure.
     pub fn take_error(&self) -> Option<String> {
-        self.errors.try_recv().ok().or_else(|| {
-            let capture = self.capture.lock().unwrap_or_else(|p| p.into_inner());
-            (capture.last_input.elapsed() > Duration::from_secs(5))
-                .then(|| "The call microphone stopped delivering audio".to_owned())
-        })
+        self.errors.try_recv().ok()
     }
 }
 
@@ -148,6 +171,14 @@ fn open_devices(
         frames: playout,
         current: Vec::new().into_iter(),
     });
+    let input = open_input(capture, errors)?;
+    Ok((input, output))
+}
+
+fn open_input(
+    capture: Arc<Mutex<Capture>>,
+    errors: Sender<String>,
+) -> Result<cpal::Stream, String> {
     let device = cpal::default_host()
         .default_input_device()
         .ok_or_else(|| "No microphone available for the call".to_owned())?;
@@ -157,6 +188,8 @@ fn open_devices(
     let config = supported.config();
     {
         let mut state = capture.lock().unwrap_or_else(|p| p.into_inner());
+        state.reset();
+        state.last_input = Instant::now();
         state.input_rate = config.sample_rate;
         state.channels = config.channels;
     }
@@ -178,7 +211,7 @@ fn open_devices(
     input
         .play()
         .map_err(|_| "Could not start the call microphone".to_owned())?;
-    Ok((input, output))
+    Ok(input)
 }
 
 fn input_stream<T>(
@@ -210,6 +243,31 @@ where
     )
 }
 
+#[derive(Default)]
+struct CaptureRecovery {
+    reopened: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum CaptureHealth {
+    Healthy,
+    Reopen,
+    Failed,
+}
+
+impl CaptureRecovery {
+    fn check(&mut self, idle: Duration) -> CaptureHealth {
+        if idle < Duration::from_secs(5) {
+            CaptureHealth::Healthy
+        } else if self.reopened {
+            CaptureHealth::Failed
+        } else {
+            self.reopened = true;
+            CaptureHealth::Reopen
+        }
+    }
+}
+
 struct Capture {
     tx: Sender<Vec<i16>>,
     stale: Receiver<Vec<i16>>,
@@ -222,6 +280,8 @@ struct Capture {
     frame: Vec<i16>,
     muted: bool,
     last_input: Instant,
+    generation: u64,
+    encoded: Option<Receiver<bytes::Bytes>>,
 }
 
 impl Capture {
@@ -238,9 +298,16 @@ impl Capture {
             frame: Vec::with_capacity(FRAME),
             muted: true,
             last_input: Instant::now(),
+            generation: 0,
+            encoded: None,
         }
     }
     fn reset(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        while self.stale.try_recv().is_ok() {}
+        if let Some(encoded) = &self.encoded {
+            while encoded.try_recv().is_ok() {}
+        }
         self.channel_count = 0;
         self.channel_sum = 0.0;
         self.weight = 0;
@@ -418,14 +485,27 @@ mod tests {
         }
         assert!(source.try_recv().unwrap().iter().all(|&s| s == 0));
         capture.lock().unwrap().last_input = Instant::now() - Duration::from_secs(6);
-        assert_eq!(
-            audio.take_error().as_deref(),
-            Some("The call microphone stopped delivering audio")
-        );
+        // Capture recovery belongs to the device thread, not the call's timer.
+        assert!(audio.take_error().is_none());
         drop(audio);
         done.try_recv().unwrap();
         assert!(source.is_closed());
     }
+    #[test]
+    fn a_stalled_microphone_gets_one_reopen_before_failure() {
+        let mut recovery = CaptureRecovery::default();
+        assert_eq!(recovery.check(Duration::ZERO), CaptureHealth::Healthy);
+        assert_eq!(
+            recovery.check(Duration::from_secs(5)),
+            CaptureHealth::Reopen
+        );
+        assert_eq!(recovery.check(Duration::ZERO), CaptureHealth::Healthy);
+        assert_eq!(
+            recovery.check(Duration::from_secs(5)),
+            CaptureHealth::Failed
+        );
+    }
+
     #[test]
     fn malformed_playout_frame_is_discarded() {
         let (tx, rx) = async_channel::bounded(QUEUED_FRAMES);

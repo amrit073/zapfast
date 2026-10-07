@@ -265,7 +265,10 @@ the tray. Quitting the app ends the call.
 
 Calls use your system's default microphone and speakers when the call starts.
 Allow microphone access if your operating system asks. Restart the call after
-changing audio devices. There is no echo cancellation yet, so use headphones
+changing audio devices. If capture stops delivering samples for five seconds,
+ZapFast tries reopening the default microphone once before ending the call.
+Voice calls request standard Opus through the protocol library to avoid MLOW
+frame formats the current decoder cannot play. There is no echo cancellation yet, so use headphones
 to keep speaker audio out of the microphone. Call audio is streamed
 through WhatsApp and is not saved in your message archive. Video calls, group
 calls, call links, and screen sharing are not implemented yet.
