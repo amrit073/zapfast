@@ -1,4 +1,4 @@
-name: Linux artifacts
+name: Arch Linux package
 
 on:
   push:
@@ -24,53 +24,43 @@ jobs:
       - name: Install build and packaging dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev cmake perl libarchive-tools squashfs-tools
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '4.0'
-      - name: Install packaging tool
-        run: gem install native-packages --version 0.8.1 --no-document
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libasound2-dev cmake perl
       - name: Build
         env:
           ZAPFAST_GIPHY_KEY: ${{ secrets.ZAPFAST_GIPHY_KEY || secrets.FASTSAPP_GIPHY_KEY }}
         run: cargo build --release --locked
-      - name: Package portable archive
-        id: package
+      - name: Prepare Arch package
         shell: bash
         run: |
           base=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
-          version="${base}-dev.${GITHUB_RUN_NUMBER}.${GITHUB_SHA:0:12}"
+          version="${base}.r${GITHUB_RUN_NUMBER}.g${GITHUB_SHA:0:12}"
           name="zapfast-v${version}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/$name" dist/artifacts
           cp target/release/zapfast "dist/$name/"
           cp README.md LICENSE THIRD-PARTY-NOTICES.md packaging/zapfast-portable.txt "dist/$name/"
           cp --parents packaging/applications/zapfast.desktop packaging/icons/zapfast.svg contrib/omarchy/zapfast.json.tpl contrib/omarchy/zapfast-theme "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
-          cp "dist/$name.tar.gz" dist/artifacts/
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          python3 packaging/arch/personal.py "$version" "dist/$name.tar.gz"
           printf 'Commit: %s\nBuild: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > dist/artifacts/BUILD.txt
-      - name: Build AppImage
-        env:
-          VERSION: ${{ steps.package.outputs.version }}
+      - name: Build and test Arch package
         run: |
-          native-packages build --version "$VERSION" --target linux-amd64 --format appimage --defer-recipes --output dist/native
-          cp dist/native/packages/linux-amd64/appimage/*.AppImage dist/artifacts/
-      - name: Smoke test packages and record checksums
-        shell: bash
-        run: |
-          mkdir -p dist/smoke
-          tar -xzf dist/artifacts/*.tar.gz -C dist/smoke
-          binaries=(dist/smoke/*/zapfast)
-          "${binaries[0]}" --version
-          images=(dist/artifacts/*.AppImage)
-          "${images[0]}" --appimage-extract-and-run --version
+          docker run --rm -v "$PWD/dist/arch:/work" -w /work archlinux:base-devel bash -euc '
+            pacman -Syu --noconfirm
+            useradd -m builder
+            chown -R builder:builder /work
+            runuser -u builder -- makepkg --nodeps --noconfirm
+            pacman -U --noconfirm ./*.pkg.tar.zst
+            zapfast --version
+            pacman -Qk zapfast-bin
+          '
+          cp dist/arch/*.pkg.tar.zst dist/artifacts/
           cd dist/artifacts
-          sha256sum -- *.tar.gz *.AppImage > checksums.txt
+          sha256sum -- *.pkg.tar.zst > checksums.txt
           sha256sum --check checksums.txt
-      - name: Upload Linux downloads
+      - name: Upload Arch package
         uses: actions/upload-artifact@v7
         with:
-          name: zapfast-linux-x86_64-${{ github.sha }}
+          name: zapfast-arch-x86_64-${{ github.sha }}
           path: dist/artifacts/
           if-no-files-found: error
           compression-level: 0

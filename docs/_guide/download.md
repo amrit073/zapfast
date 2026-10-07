@@ -103,15 +103,19 @@ offer no usable OpenGL, and Windows then shows a message instead of starting.
 SmartScreen may warn about an unknown publisher on first run. Choose **More
 info**, then **Run anyway**.
 
-## Development builds
+## Personal Arch Linux build
 
-For the latest code on x86_64 Linux, open the repository's **Actions** tab,
-select **Linux artifacts**, and open a successful run on `main`. Download the
-artifact at the bottom of the run page while signed in to GitHub. It contains
-a portable archive, an AppImage, checksums, and the source commit. Downloads
-expire after 30 days.
+In this fork, open **Actions**, select **Arch Linux package**, and open a
+successful run on `main`. Download and extract the artifact at the bottom of
+the run page while signed in to GitHub. Downloads expire after 30 days.
 
-These development builds work on current Arch Linux and other distributions
-with glibc 2.39 or newer and the Linux libraries listed above. Extract the
-portable archive and run `zapfast`, or make the AppImage executable and run it.
-If FUSE is unavailable, run the AppImage with `--appimage-extract-and-run`.
+On x86_64 Arch Linux, verify and install the package from the extracted folder:
+
+```sh
+sha256sum --check checksums.txt
+sudo pacman -U ./zapfast-bin-*.pkg.tar.zst
+```
+
+Launch `zapfast` from your desktop menu or terminal. The package includes the
+current source changes and uses the same local account data as other ZapFast
+installations. The artifact's `BUILD.txt` identifies the source commit.
