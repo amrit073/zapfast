@@ -261,6 +261,12 @@ yet.
 
 ## Voice calls
 
+Incoming voice calls play a repeating ringtone through the default speakers,
+even while another account is on screen or ZapFast is hidden in the tray.
+The ringing stops when you answer, decline, or the call ends. Disabling
+notifications for the receiving account silences it; calls from locked chats
+also stay silent. The call’s desktop notification does not play a second sound.
+
 In a one-to-one chat, choose the phone button in the header to start a voice
 call. Incoming calls show **Accept** and **Decline**. The call controls stay
 above your chats when you switch chats, open Settings, or switch accounts;

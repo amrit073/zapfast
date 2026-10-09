@@ -5,6 +5,21 @@ use crate::backend::Command;
 use crate::model::{AccountId, ActiveCall, CallPhase, Chat, ChatId, ChatKind};
 
 impl App {
+    pub(super) fn sync_ringtone(&mut self) {
+        let ringing = self.call.as_ref().is_some_and(|call| {
+            call.phase == CallPhase::Incoming
+                && self.accounts.iter().any(|account| {
+                    account.id == call.account_id
+                        && account.settings.notifications
+                        && !account
+                            .chats
+                            .iter()
+                            .any(|chat| chat.id == call.peer && chat.locked)
+                })
+        });
+        self.ringtone.set_ringing(ringing);
+    }
+
     pub fn calls_use_proxy(&self) -> bool {
         !self.settings.proxy.trim().is_empty() || crate::proxy::for_whatsapp().is_some()
     }
@@ -78,6 +93,7 @@ impl App {
         {
             return;
         }
+        self.ringtone.set_ringing(false);
         self.clear_call_notification(account, id);
         self.prepare_call_audio();
         self.call.as_mut().unwrap().phase = CallPhase::Connecting;
@@ -94,6 +110,7 @@ impl App {
         }
         call.phase = CallPhase::Ending;
         let (account, id) = (call.account_id.clone(), call.id.clone());
+        self.ringtone.set_ringing(false);
         self.clear_call_notification(&account, &id);
         self.send_call_command(&account, Command::EndCall { id });
     }
@@ -128,6 +145,7 @@ impl App {
                 }
                 call.muted = muted;
             }
+            self.sync_ringtone();
             return;
         }
         if phase != CallPhase::Incoming || self.call.is_some() || self.calls_use_proxy() {
@@ -160,6 +178,7 @@ impl App {
             phase,
             muted,
         });
+        self.sync_ringtone();
         self.wants_attention = true;
         if self.account().settings.notifications && !private {
             let waker = self.waker.clone();
@@ -171,7 +190,7 @@ impl App {
                 },
                 "Incoming voice call".into(),
                 None,
-                crate::settings::NotificationSound::Alert,
+                crate::settings::NotificationSound::None,
                 crate::notify::NotificationTarget {
                     account,
                     chat: format!("call:{id}"),
@@ -194,6 +213,7 @@ impl App {
             && call.peer == peer
         {
             call.name = "WhatsApp caller".into();
+            self.ringtone.set_ringing(false);
             let id = call.id.clone();
             self.clear_call_notification(&account, &id);
         }
@@ -206,6 +226,7 @@ impl App {
             return;
         }
         self.call = None;
+        self.sync_ringtone();
         if !reason.is_empty() && !self.app_lock.is_locked() {
             self.toast(reason);
         }
@@ -269,12 +290,15 @@ mod tests {
     fn accepting_and_ending_wait_for_worker_and_reject_stale_callbacks() {
         let (_directory, mut app, mut commands) = app();
         incoming(&mut app, "first");
+        assert!(app.ringtone.is_ringing());
         assert!(commands.try_recv().is_err(), "ringing must not open audio");
         let account = app.account().id.clone();
         app.accept_call(&account, "first");
+        assert!(!app.ringtone.is_ringing());
         assert!(matches!(commands.try_recv(), Ok(Command::AcceptCall { id }) if id == "first"));
         incoming(&mut app, "first");
         assert_eq!(app.call.as_ref().unwrap().phase, CallPhase::Connecting);
+        assert!(!app.ringtone.is_ringing());
         app.stop_call();
         assert!(matches!(commands.try_recv(), Ok(Command::EndCall { id }) if id == "first"));
         assert_eq!(app.call.as_ref().unwrap().phase, CallPhase::Ending);
@@ -355,6 +379,43 @@ mod tests {
     }
 
     #[test]
+    fn ringtone_uses_call_account_settings_and_stops_on_remote_or_local_end() {
+        let (_directory, mut app, _) = app();
+        let (mut second, _) =
+            crate::account::Account::detached(&app.dirs, AccountId("2".into()), Default::default())
+                .unwrap();
+        second.settings.notifications = false;
+        app.accounts.push(second);
+        incoming(&mut app, "ringing");
+        assert!(app.ringtone.is_ringing());
+        assert_eq!(
+            app.notifications.shown.last().unwrap().sound,
+            crate::settings::NotificationSound::None
+        );
+        app.active = 1;
+        app.sync_ringtone();
+        assert!(
+            app.ringtone.is_ringing(),
+            "switching accounts must not silence the call"
+        );
+        app.handle_call_ended("ringing", "wrong account");
+        assert!(app.ringtone.is_ringing());
+        app.accounts[0].settings.notifications = false;
+        app.sync_ringtone();
+        assert!(!app.ringtone.is_ringing());
+        app.accounts[0].settings.notifications = true;
+        app.sync_ringtone();
+        assert!(app.ringtone.is_ringing());
+        app.active = 0;
+        app.handle_call_ended("ringing", "remote hangup");
+        assert!(!app.ringtone.is_ringing());
+        incoming(&mut app, "decline");
+        assert!(app.ringtone.is_ringing());
+        app.stop_call();
+        assert!(!app.ringtone.is_ringing());
+    }
+
+    #[test]
     fn locking_ends_call_and_locked_incoming_never_opens_microphone() {
         let (_directory, mut app, mut commands) = app();
         app.settings.app_lock_hash = Some("fixture verifier".into());
@@ -416,6 +477,7 @@ mod tests {
         incoming(&mut app, "private");
         assert_eq!(app.call.as_ref().unwrap().name, "WhatsApp caller");
         assert!(app.notifications.shown.is_empty());
+        assert!(!app.ringtone.is_ringing());
         let ctx = egui::Context::default();
         app.apply(Action::StartRecording, &ctx);
         app.apply(Action::PlayVideoWhenDownloaded("video".into()), &ctx);

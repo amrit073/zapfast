@@ -4,6 +4,9 @@
 //! its own thread because delivery and click handling can block. A click hands
 //! back the chat and the message it announced.
 
+mod ringtone;
+pub use ringtone::Ringtone;
+
 use crate::settings::NotificationSound;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};

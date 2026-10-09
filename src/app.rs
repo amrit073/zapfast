@@ -348,6 +348,7 @@ pub struct UnreadDivider {
 pub struct App {
     /// Calls belong to the process, not the currently visible account.
     pub call: Option<crate::model::ActiveCall>,
+    ringtone: crate::notify::Ringtone,
     call_opens: std::sync::Arc<std::sync::Mutex<Vec<crate::notify::NotificationTarget>>>,
     pub dirs: AppDirs,
     pub settings: Settings,
@@ -986,6 +987,9 @@ impl App {
         let tray_lockable = settings.app_lock_hash.is_some();
         let mut app = Self {
             call: None,
+            ringtone: crate::notify::Ringtone::new(
+                !cfg!(test) && !accounts[active].backend.is_offline(),
+            ),
             call_opens: Default::default(),
             dirs,
             settings,
@@ -5925,6 +5929,7 @@ impl App {
         self.tick_audio();
         self.tick_video(ctx);
         self.apply_actions(ctx);
+        self.sync_ringtone();
         self.hold_media();
         self.follow_receipts();
         self.sync_badge();
