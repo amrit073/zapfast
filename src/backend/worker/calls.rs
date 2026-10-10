@@ -461,11 +461,16 @@ async fn run_call(
     let timeout = tokio::time::sleep(RING_TIMEOUT);
     tokio::pin!(timeout);
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut next_audio_log = Instant::now() + Duration::from_secs(5);
     while reason.is_none() {
         tokio::select! {
             _ = handle.wait_ended() => reason = Some("Call media task ended"),
             _ = &mut timeout, if phase != CallPhase::Active => reason = Some("No answer or call connection timed out"),
             _ = tick.tick() => {
+                if Instant::now() >= next_audio_log {
+                    ports.log_flow(&audio);
+                    next_audio_log = Instant::now() + Duration::from_secs(10);
+                }
                 if let Some(error) = audio.take_error().or_else(|| ports.take_error()) {
                     log::warn!("call: audio device failure: {error}");
                     reason = Some("The microphone or speaker stopped working");
@@ -511,6 +516,7 @@ async fn run_call(
             });
         }
     }
+    ports.log_flow(&audio);
     audio.set_muted(true);
     // Also silence a frame already dequeued by the upstream PCM adapter.
     let _ = tokio::time::timeout(Duration::from_millis(250), handle.set_muted(true)).await;
@@ -524,6 +530,9 @@ async fn set_call_muted(handle: &CallHandle, audio: &CallAudio, muted: bool) -> 
     audio.set_muted(true);
     let announced = tokio::time::timeout(Duration::from_secs(1), handle.set_muted(muted)).await;
     let effective = muted || !matches!(announced, Ok(Ok(())));
+    if !muted && effective {
+        log::warn!("call: microphone remains muted because unmute signaling failed or timed out");
+    }
     audio.set_muted(effective);
     effective
 }

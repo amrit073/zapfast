@@ -1,6 +1,9 @@
 //! One cancellable ringtone for the process-wide incoming call.
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+static OUTPUT_ACCESS: Mutex<()> = Mutex::new(());
 
 pub struct Ringtone {
     audible: bool,
@@ -8,6 +11,12 @@ pub struct Ringtone {
 }
 
 impl Ringtone {
+    /// Called only on audio workers, never the UI thread. Hold this while a
+    /// ringtone owns output or while call devices are opening.
+    pub(crate) fn output_access() -> MutexGuard<'static, ()> {
+        OUTPUT_ACCESS.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     pub fn new(audible: bool) -> Self {
         Self {
             audible,
@@ -26,6 +35,10 @@ impl Ringtone {
                 let result = std::thread::Builder::new()
                     .name("call-ringtone".into())
                     .spawn(move || {
+                        let _access = Self::output_access();
+                        if !matches!(stopped.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                            return;
+                        }
                         let Ok(device) = crate::audio::open_output() else {
                             log::warn!("call: could not open ringtone output");
                             return;
@@ -96,6 +109,26 @@ mod tests {
         }
         drop(stop);
         finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn call_open_waits_until_ringtone_device_is_released() {
+        let access = Ringtone::output_access();
+        let (ready_tx, ready) = mpsc::channel();
+        let (opened_tx, opened) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let _call_access = Ringtone::output_access();
+            opened_tx.send(()).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            opened.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(access);
+        opened.recv_timeout(Duration::from_secs(1)).unwrap();
         thread.join().unwrap();
     }
 

@@ -7,7 +7,7 @@ mod opus;
 pub use opus::OpusPorts;
 
 use std::num::NonZero;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -53,6 +53,7 @@ pub struct CallAudio {
     errors: Receiver<String>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    played: Arc<AtomicU64>,
     _devices: DeviceLease,
 }
 
@@ -60,6 +61,9 @@ impl CallAudio {
     /// Opens default devices with capture muted. Call from a blocking task.
     pub fn open() -> Result<Self, String> {
         let devices = DeviceLease::acquire(&DEVICES_IN_USE)?;
+        let _ringtone_released = crate::notify::Ringtone::output_access();
+        let played = Arc::new(AtomicU64::new(0));
+        let worker_played = Arc::clone(&played);
         let (tx, source) = async_channel::bounded(QUEUED_FRAMES);
         let (sink, rx) = async_channel::bounded(QUEUED_FRAMES);
         let (errors_tx, errors) = async_channel::bounded(1);
@@ -69,7 +73,7 @@ impl CallAudio {
         let (ready_tx, ready) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("call-audio".into())
-            .spawn(move || match open_devices(Arc::clone(&capture_worker), rx, errors_tx.clone()) {
+            .spawn(move || match open_devices(Arc::clone(&capture_worker), rx, errors_tx.clone(), worker_played) {
                 Ok((input, output)) => {
                     let mut input = Some(input);
                     let mut recovery = CaptureRecovery::default();
@@ -113,6 +117,7 @@ impl CallAudio {
             errors,
             stop: Some(stop),
             thread: Some(thread),
+            played,
             _devices: devices,
         };
         ready
@@ -157,6 +162,7 @@ fn open_devices(
     capture: Arc<Mutex<Capture>>,
     playout: Receiver<Vec<i16>>,
     errors: Sender<String>,
+    played: Arc<AtomicU64>,
 ) -> Result<(cpal::Stream, rodio::MixerDeviceSink), String> {
     let output_errors = errors.clone();
     let mut output = rodio::DeviceSinkBuilder::from_default_device()
@@ -169,6 +175,7 @@ fn open_devices(
     output.log_on_drop(false);
     output.mixer().add(Playout {
         frames: playout,
+        played,
         current: Vec::new().into_iter(),
     });
     let input = open_input(capture, errors)?;
@@ -281,6 +288,7 @@ struct Capture {
     muted: bool,
     last_input: Instant,
     generation: u64,
+    captured_frames: u64,
     encoded: Option<Receiver<bytes::Bytes>>,
 }
 
@@ -299,6 +307,7 @@ impl Capture {
             muted: true,
             last_input: Instant::now(),
             generation: 0,
+            captured_frames: 0,
             encoded: None,
         }
     }
@@ -345,6 +354,7 @@ impl Capture {
                 self.weight = 0;
                 self.sum = 0.0;
                 if self.frame.len() == FRAME {
+                    self.captured_frames += 1;
                     let frame = std::mem::replace(&mut self.frame, Vec::with_capacity(FRAME));
                     if let Err(async_channel::TrySendError::Full(frame)) = self.tx.try_send(frame) {
                         let _ = self.stale.try_recv();
@@ -357,6 +367,7 @@ impl Capture {
 }
 
 struct Playout {
+    played: Arc<AtomicU64>,
     frames: Receiver<Vec<i16>>,
     current: std::vec::IntoIter<i16>,
 }
@@ -380,6 +391,7 @@ impl Iterator for Playout {
                 if frame.len() > MAX_PLAYOUT {
                     return Some(0.0);
                 }
+                self.played.fetch_add(1, Ordering::Relaxed);
                 self.current = frame.into_iter();
                 Some(self.current.next().map_or(0.0, |s| f32::from(s) / 32768.0))
             }
@@ -472,6 +484,7 @@ mod tests {
             errors,
             stop: Some(stop),
             thread: Some(thread),
+            played: Default::default(),
             _devices: DeviceLease::acquire(&TEST_DEVICES).unwrap(),
         };
         for _ in 0..FRAME {
@@ -510,12 +523,14 @@ mod tests {
     fn malformed_playout_frame_is_discarded() {
         let (tx, rx) = async_channel::bounded(QUEUED_FRAMES);
         let mut player = Playout {
+            played: Default::default(),
             frames: rx,
             current: Vec::new().into_iter(),
         };
         tx.try_send(vec![32767; MAX_PLAYOUT + 1]).unwrap();
         assert_eq!(player.next(), Some(0.0));
         assert_eq!(player.current.len(), 0);
+        assert_eq!(player.played.load(Ordering::Relaxed), 0);
     }
     #[test]
     fn device_lease_stays_exclusive_until_native_owner_finishes() {
@@ -536,6 +551,7 @@ mod tests {
     fn full_playout_queue_skips_to_recent_speech() {
         let (tx, rx) = async_channel::bounded(QUEUED_FRAMES);
         let mut player = Playout {
+            played: Default::default(),
             frames: rx,
             current: Vec::new().into_iter(),
         };
@@ -549,6 +565,7 @@ mod tests {
     fn playback_underflow_is_silent_and_closed_channel_finishes() {
         let (tx, rx) = async_channel::bounded(QUEUED_FRAMES);
         let mut player = Playout {
+            played: Default::default(),
             frames: rx,
             current: Vec::new().into_iter(),
         };
@@ -556,6 +573,7 @@ mod tests {
         tx.try_send(vec![16384, -16384]).unwrap();
         assert_eq!(player.next(), Some(0.5));
         assert_eq!(player.next(), Some(-0.5));
+        assert_eq!(player.played.load(Ordering::Relaxed), 1);
         drop(tx);
         assert_eq!(player.next(), None);
     }

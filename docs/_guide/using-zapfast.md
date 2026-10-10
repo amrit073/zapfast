@@ -263,7 +263,8 @@ yet.
 
 Incoming voice calls play a repeating ringtone through the default speakers,
 even while another account is on screen or ZapFast is hidden in the tray.
-The ringing stops when you answer, decline, or the call ends. Disabling
+The ringing stops when you answer, decline, or the call ends. Call audio waits
+for the ringtone to release its speaker device before opening. Disabling
 notifications for the receiving account silences it; calls from locked chats
 also stay silent. The call’s desktop notification does not play a second sound.
 
@@ -304,7 +305,9 @@ On Linux, the current run's log is at
 when `XDG_STATE_HOME` is set). Save it before restarting,
 which replaces it. Call diagnostics identify incoming-offer filtering, whether
 the account was hidden, audio-device setup, and media-connection failures. They
-do not include caller identities, call identifiers, audio, or packet contents.
+also count captured, encoded, received, decoded, and played audio frames and
+report whether the microphone is muted. They do not include caller identities,
+call identifiers, audio, or packet contents.
 Share only the relevant excerpt around an attempt. A decoder warning alone
 does not establish why a call disconnected.
 
