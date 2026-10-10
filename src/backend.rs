@@ -563,6 +563,14 @@ pub enum Command {
         first_name: Option<String>,
         error: Option<String>,
     },
+    LookupContact {
+        request: u64,
+        phone: String,
+    },
+    ContactLookupResult {
+        request: u64,
+        result: Result<Option<crate::model::ContactPreview>, String>,
+    },
     /// Checks a number, optionally saves it, and opens its chat.
     NewContact {
         phone: String,
@@ -968,6 +976,10 @@ pub enum Event {
     InviteJoined {
         code: String,
         result: Result<(ChatId, bool), String>,
+    },
+    ContactLookupResult {
+        request: u64,
+        result: Result<Option<crate::model::ContactPreview>, String>,
     },
     /// Number lookup succeeded and its chat can open.
     ContactReady {

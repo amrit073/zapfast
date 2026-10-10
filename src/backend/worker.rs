@@ -5137,6 +5137,59 @@ impl Worker {
                 self.emit(Event::Info(format!("Added {name} to contacts")));
                 self.emit_chat(&id);
             }
+            Command::LookupContact { request, phone } => {
+                let Some(client) = self.client.clone().filter(|client| client.is_connected())
+                else {
+                    self.emit(Event::ContactLookupResult {
+                        request,
+                        result: Err("Connect to WhatsApp to check this number.".into()),
+                    });
+                    return;
+                };
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let lookup = async {
+                        let results = client
+                            .contacts()
+                            .is_on_whatsapp(&[Jid::pn(&phone)])
+                            .await
+                            .map_err(|_| "Could not check this number. Try again.".to_owned())?;
+                        let entry = results.into_iter().next().ok_or_else(|| {
+                            "WhatsApp did not return a result. Try again.".to_owned()
+                        })?;
+                        if entry.contact_error.is_some() {
+                            return Err("Could not check this number. Try again.".into());
+                        }
+                        Ok(entry.is_registered.then(|| crate::model::ContactPreview {
+                            id: format!("{phone}@s.whatsapp.net"),
+                            name: entry
+                                .verified_name
+                                .and_then(|name| name.name)
+                                .filter(|name| !name.trim().is_empty()),
+                        }))
+                    };
+                    let result = tokio::time::timeout(Duration::from_secs(15), lookup)
+                        .await
+                        .unwrap_or_else(|_| Err("Number lookup timed out. Try again.".into()));
+                    let _ = commands.send(Command::ContactLookupResult { request, result });
+                });
+            }
+            Command::ContactLookupResult {
+                request,
+                mut result,
+            } => {
+                if let Ok(Some(preview)) = &mut result {
+                    if let Ok(jid) = preview.id.parse::<Jid>() {
+                        preview.id = self.canonical(&jid);
+                    }
+                    if let Ok(Some(contact)) = self.archive.contact(&preview.id)
+                        && let Some(name) = contact.display_name()
+                    {
+                        preview.name = Some(name.to_owned());
+                    }
+                }
+                self.emit(Event::ContactLookupResult { request, result });
+            }
             Command::NewContact {
                 phone,
                 full_name,

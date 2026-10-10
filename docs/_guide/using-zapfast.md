@@ -357,6 +357,16 @@ newest-message button or `End` to return to the latest message when you are
 ready. The chat list scrolls to the top after you send, where the chat now is.
 Under the **Favorites** chip, the list keeps the phone's order and stays in place.
 
+To look up a new number, open **New chat → Add contact**, enter the full number
+with its country code, and click **Check number**. ZapFast asks WhatsApp whether
+it is registered and shows an available profile photo and name before you send
+anything. A known contact name or a business name returned by WhatsApp can appear;
+this lookup cannot fetch every person's personal profile name. Private or missing
+photos use initials instead. Failed checks offer a retry rather than claiming the
+number is unregistered. Checking alone does not save a contact or open a chat.
+Click **Message** to open the chat without saving, or enter a name and choose
+**Save contact**. The preview belongs to the account that requested it.
+
 A shared contact message shows the name from its vCard. When the card names a
 WhatsApp account, **Chat** opens a private conversation with it and, if the
 person is not already in ZapFast's contacts, **Add** saves them, adding them to

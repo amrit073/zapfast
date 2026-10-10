@@ -1455,6 +1455,71 @@ fn new_contact(app: &mut App, ui: &mut egui::Ui) {
         .chars()
         .filter(char::is_ascii_digit)
         .collect();
+    let lookup = app
+        .contact_lookup
+        .clone()
+        .filter(|lookup| lookup.phone == digits);
+    let checking = lookup
+        .as_ref()
+        .is_some_and(|lookup| lookup.result.is_none());
+    ui.add_space(6.0);
+    let check = ui
+        .add_enabled_ui((7..=15).contains(&digits.len()) && !checking, |ui| {
+            theme::pill_button(ui, &palette, "Check number", false)
+        })
+        .inner;
+    if check.clicked() {
+        app.actions.push(Action::LookupContact(digits.clone()));
+    }
+    if let Some(lookup) = lookup {
+        match lookup.result {
+            None => {
+                theme::text(
+                    ui,
+                    "Checking the number…",
+                    theme::regular(13.0),
+                    palette.secondary,
+                );
+            }
+            Some(Err(error)) => {
+                theme::paragraph(ui, &error, theme::regular(13.0), palette.secondary);
+            }
+            Some(Ok(None)) => {
+                theme::text(
+                    ui,
+                    "This number is not on WhatsApp.",
+                    theme::regular(13.0),
+                    palette.secondary,
+                );
+            }
+            Some(Ok(Some(preview))) => {
+                let name = preview
+                    .name
+                    .unwrap_or_else(|| crate::util::phone(&preview.id));
+                let picture = app.avatar(&preview.id);
+                ui.horizontal(|ui| {
+                    super::widgets::avatar(
+                        ui,
+                        &palette,
+                        &name,
+                        &preview.id,
+                        44.0,
+                        picture.as_deref(),
+                    );
+                    ui.vertical(|ui| {
+                        theme::text(ui, &name, theme::semibold(14.0), palette.text);
+                        theme::text(ui, "On WhatsApp", theme::regular(12.5), palette.secondary);
+                    });
+                });
+                theme::paragraph(
+                    ui,
+                    "Names and photos are shown when available. A private photo may not appear.",
+                    theme::regular(12.0),
+                    palette.secondary,
+                );
+            }
+        }
+    }
     let ready = digits.len() >= 7 && !app.new_contact_pending;
     let named = !app.new_contact_name.trim().is_empty() || !app.new_contact_last.trim().is_empty();
     let submitted =

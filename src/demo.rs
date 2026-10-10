@@ -2329,6 +2329,18 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     });
             }
             "new-contact" => app.dialog = Some(Dialog::NewContact),
+            "contact-preview" => {
+                app.dialog = Some(Dialog::NewContact);
+                app.new_contact_phone = crate::model::phone_of(SAMPLES[2].id).unwrap().into();
+                app.contact_lookup = Some(crate::model::ContactLookup {
+                    request: 1,
+                    phone: app.new_contact_phone.clone(),
+                    result: Some(Ok(Some(crate::model::ContactPreview {
+                        id: SAMPLES[2].id.into(),
+                        name: Some("Grace Hopper".into()),
+                    }))),
+                });
+            }
             // The switcher under our avatar open with the one account.
             "account-menu" => app.account_menu = true,
             // A second number linked beside the first, with unread chats of
@@ -4317,6 +4329,7 @@ mod tests {
             "delete-message",
             "delete-message-mine",
             "new-contact",
+            "contact-preview",
             "accounts",
             "accounts,light",
             "accounts-closed",
@@ -9239,6 +9252,37 @@ mod tests {
             .unwrap_or_else(|| panic!("no {label} button"))
             .1
             .is_disabled()
+    }
+
+    #[test]
+    fn contact_preview_displays_results_and_hides_them_when_the_number_changes() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        apply_flags(&mut app, Some("contact-preview"));
+        app.attach(&ctx);
+        assert!(
+            accessible_labels(&mut app, &ctx)
+                .iter()
+                .any(|s| s == "On WhatsApp")
+        );
+        app.new_contact_phone = "15550009999".into();
+        assert!(
+            !accessible_labels(&mut app, &ctx)
+                .iter()
+                .any(|s| s == "On WhatsApp")
+        );
+        app.new_contact_phone = app.contact_lookup.as_ref().unwrap().phone.clone();
+        for (result, text) in [
+            (Some(Ok(None)), "This number is not on WhatsApp."),
+            (
+                Some(Err("Could not check this number. Try again.".into())),
+                "Could not check this number. Try again.",
+            ),
+            (None, "Checking the number…"),
+        ] {
+            app.contact_lookup.as_mut().unwrap().result = result;
+            assert!(accessible_labels(&mut app, &ctx).iter().any(|s| s == text));
+        }
     }
 
     /// A button that cannot act yet must say so, on screen and to screen

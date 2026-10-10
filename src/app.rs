@@ -2877,6 +2877,13 @@ impl App {
                     }
                 }
             }
+            Event::ContactLookupResult { request, result } => {
+                if let Some(lookup) = self.contact_lookup.as_mut()
+                    && lookup.request == request
+                {
+                    lookup.result = Some(result);
+                }
+            }
             Event::ContactReady { id, name } => {
                 self.new_contact_pending = false;
                 if live && self.dialog == Some(Dialog::NewContact) {
@@ -5218,6 +5225,7 @@ impl App {
                     self.pair_phone.clear();
                 }
                 if dialog == Dialog::NewContact {
+                    self.contact_lookup = None;
                     self.new_contact_to_phone = self.account().settings.save_contacts_to_phone;
                     self.new_contact_phone.clear();
                     self.new_contact_name.clear();
@@ -5229,6 +5237,7 @@ impl App {
                 self.dialog = Some(dialog);
             }
             Action::CloseDialog => {
+                self.contact_lookup = None;
                 self.clear_chat_lock_entry();
                 self.dialog = None;
                 self.invite = None;
@@ -5253,6 +5262,19 @@ impl App {
                     first_name,
                     to_phone: self.account().settings.save_contacts_to_phone,
                 });
+            }
+            Action::LookupContact(phone) => {
+                if !(7..=15).contains(&phone.len()) || !phone.bytes().all(|b| b.is_ascii_digit()) {
+                    return;
+                }
+                self.contact_lookup_generation = self.contact_lookup_generation.wrapping_add(1);
+                let request = self.contact_lookup_generation;
+                self.contact_lookup = Some(crate::model::ContactLookup {
+                    request,
+                    phone: phone.clone(),
+                    result: None,
+                });
+                self.backend.send(Command::LookupContact { request, phone });
             }
             Action::NewContact {
                 phone,
@@ -7292,6 +7314,98 @@ mod tests {
             [false; 0],
             "a chat at its start is not asked again"
         );
+    }
+
+    #[test]
+    fn contact_preview_ignores_replaced_and_closed_requests_without_opening_or_saving() {
+        let mut app = app();
+        let (backend, mut commands, events) = Backend::recording_with_events();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        app.apply(Action::ShowDialog(Dialog::NewContact), &ctx);
+        app.apply(Action::LookupContact("15551234567".into()), &ctx);
+        let first = app.contact_lookup.as_ref().unwrap().request;
+        app.apply(Action::LookupContact("15557654321".into()), &ctx);
+        let second = app.contact_lookup.as_ref().unwrap().request;
+        events
+            .send(Event::ContactLookupResult {
+                request: first,
+                result: Ok(None),
+            })
+            .unwrap();
+        app.handle_events();
+        assert!(app.contact_lookup.as_ref().unwrap().result.is_none());
+        let preview = crate::model::ContactPreview {
+            id: "15557654321@s.whatsapp.net".into(),
+            name: None,
+        };
+        events
+            .send(Event::ContactLookupResult {
+                request: second,
+                result: Ok(Some(preview.clone())),
+            })
+            .unwrap();
+        app.handle_events();
+        assert_eq!(
+            app.contact_lookup.as_ref().unwrap().result,
+            Some(Ok(Some(preview)))
+        );
+        assert!(app.open_chat.is_none());
+        assert!(app.contacts.is_empty());
+        assert!(app.actions.is_empty());
+        assert!(
+            std::iter::from_fn(|| commands.try_recv().ok())
+                .all(|c| matches!(c, Command::LookupContact { .. }))
+        );
+        app.apply(Action::CloseDialog, &ctx);
+        events
+            .send(Event::ContactLookupResult {
+                request: second,
+                result: Ok(None),
+            })
+            .unwrap();
+        app.handle_events();
+        assert!(app.contact_lookup.is_none());
+        app.apply(Action::ShowDialog(Dialog::NewContact), &ctx);
+        app.apply(Action::LookupContact("15557654321".into()), &ctx);
+        assert_ne!(app.contact_lookup.as_ref().unwrap().request, second);
+    }
+
+    #[test]
+    fn contact_preview_results_stay_with_the_originating_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = two_accounts(directory.path());
+        let (backend, _, events) = Backend::recording_with_events();
+        app.accounts[1].backend = backend;
+        for account in &mut app.accounts {
+            account.contact_lookup = Some(crate::model::ContactLookup {
+                request: 1,
+                phone: "15551234567".into(),
+                result: None,
+            });
+        }
+        app.active = 0;
+        events
+            .send(Event::ContactLookupResult {
+                request: 1,
+                result: Err("Lookup timed out".into()),
+            })
+            .unwrap();
+        app.handle_events();
+        assert!(
+            app.accounts[0]
+                .contact_lookup
+                .as_ref()
+                .unwrap()
+                .result
+                .is_none()
+        );
+        assert!(matches!(
+            app.accounts[1].contact_lookup.as_ref().unwrap().result,
+            Some(Err(_))
+        ));
+        assert_eq!(app.active, 0);
+        assert!(app.actions.is_empty());
     }
 
     #[test]
