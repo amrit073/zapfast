@@ -60,8 +60,15 @@ pub struct CallAudio {
 impl CallAudio {
     /// Opens default devices with capture muted. Call from a blocking task.
     pub fn open() -> Result<Self, String> {
+        log::info!("call: acquiring audio devices");
         let devices = DeviceLease::acquire(&DEVICES_IN_USE)?;
+        let waiting = Instant::now();
+        log::info!("call: waiting for ringtone output release");
         let _ringtone_released = crate::notify::Ringtone::output_access();
+        log::info!(
+            "call: ringtone output available; wait_ms={}",
+            waiting.elapsed().as_millis()
+        );
         let played = Arc::new(AtomicU64::new(0));
         let worker_played = Arc::clone(&played);
         let (tx, source) = async_channel::bounded(QUEUED_FRAMES);
@@ -88,7 +95,10 @@ impl CallAudio {
                                     log::warn!("call: microphone stalled; reopening default input once");
                                     drop(input.take());
                                     match open_input(Arc::clone(&capture_worker), errors_tx.clone()) {
-                                        Ok(reopened) => input = Some(reopened),
+                                        Ok(reopened) => {
+                                            log::info!("call: microphone reopened; waiting for samples");
+                                            input = Some(reopened);
+                                        },
                                         Err(error) => {
                                             let _ = errors_tx.try_send(error);
                                             break;
@@ -104,6 +114,7 @@ impl CallAudio {
                     }
                     drop(input);
                     drop(output);
+                    log::info!("call: native microphone and speaker released");
                 }
                 Err(error) => {
                     let _ = ready_tx.send(Err(error));
@@ -149,11 +160,17 @@ impl CallAudio {
 
 impl Drop for CallAudio {
     fn drop(&mut self) {
+        log::info!("call: stopping audio worker");
+        let stopping = Instant::now();
         self.source.close();
         self.sink.close();
         self.stop.take();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let joined = thread.join().is_ok();
+            log::info!(
+                "call: audio worker stopped; joined={joined}, elapsed_ms={}",
+                stopping.elapsed().as_millis()
+            );
         }
     }
 }
@@ -164,6 +181,7 @@ fn open_devices(
     errors: Sender<String>,
     played: Arc<AtomicU64>,
 ) -> Result<(cpal::Stream, rodio::MixerDeviceSink), String> {
+    log::info!("call: opening default speaker");
     let output_errors = errors.clone();
     let mut output = rodio::DeviceSinkBuilder::from_default_device()
         .map_err(|_| "No speakers available for the call".to_owned())?
@@ -173,6 +191,7 @@ fn open_devices(
         .open_stream()
         .map_err(|_| "Could not open the call speakers".to_owned())?;
     output.log_on_drop(false);
+    log::info!("call: default speaker stream opened");
     output.mixer().add(Playout {
         frames: playout,
         played,
@@ -186,6 +205,7 @@ fn open_input(
     capture: Arc<Mutex<Capture>>,
     errors: Sender<String>,
 ) -> Result<cpal::Stream, String> {
+    log::info!("call: opening default microphone");
     let device = cpal::default_host()
         .default_input_device()
         .ok_or_else(|| "No microphone available for the call".to_owned())?;
@@ -193,6 +213,12 @@ fn open_input(
         .default_input_config()
         .map_err(|_| "The microphone has no supported format".to_owned())?;
     let config = supported.config();
+    log::info!(
+        "call: microphone format: rate={}, channels={}, sample_format={:?}",
+        config.sample_rate,
+        config.channels,
+        supported.sample_format()
+    );
     {
         let mut state = capture.lock().unwrap_or_else(|p| p.into_inner());
         state.reset();
@@ -218,6 +244,7 @@ fn open_input(
     input
         .play()
         .map_err(|_| "Could not start the call microphone".to_owned())?;
+    log::info!("call: microphone stream started");
     Ok(input)
 }
 
@@ -238,6 +265,7 @@ where
             let mut state = capture.lock().unwrap_or_else(|p| p.into_inner());
             if !samples.is_empty() {
                 state.last_input = Instant::now();
+                state.input_callbacks += 1;
             }
             for &sample in samples {
                 state.push(sample.to_sample::<f32>());
@@ -289,6 +317,8 @@ struct Capture {
     last_input: Instant,
     generation: u64,
     captured_frames: u64,
+    input_callbacks: u64,
+    dropped_frames: u64,
     encoded: Option<Receiver<bytes::Bytes>>,
 }
 
@@ -308,6 +338,8 @@ impl Capture {
             last_input: Instant::now(),
             generation: 0,
             captured_frames: 0,
+            input_callbacks: 0,
+            dropped_frames: 0,
             encoded: None,
         }
     }
@@ -357,6 +389,7 @@ impl Capture {
                     self.captured_frames += 1;
                     let frame = std::mem::replace(&mut self.frame, Vec::with_capacity(FRAME));
                     if let Err(async_channel::TrySendError::Full(frame)) = self.tx.try_send(frame) {
+                        self.dropped_frames += 1;
                         let _ = self.stale.try_recv();
                         let _ = self.tx.try_send(frame);
                     }
@@ -448,8 +481,14 @@ mod tests {
                 capture.push(n as f32 / 10.0);
             }
         }
+        assert_eq!(capture.captured_frames, 10);
+        assert_eq!(capture.dropped_frames, 10 - QUEUED_FRAMES as u64);
         assert_eq!(rx.len(), QUEUED_FRAMES);
         assert!(rx.try_recv().unwrap()[0] > 20_000);
+        capture.reset();
+        assert_eq!(capture.captured_frames, 10);
+        assert_eq!(capture.dropped_frames, 7);
+        assert!(rx.is_empty());
     }
     #[test]
     fn mute_discards_partial_speech_and_sends_silence() {

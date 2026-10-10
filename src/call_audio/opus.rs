@@ -10,6 +10,8 @@ struct Counters {
     received: AtomicU64,
     decoded: AtomicU64,
     decode_errors: AtomicU64,
+    encode_drops: AtomicU64,
+    playout_drops: AtomicU64,
 }
 
 pub struct OpusPorts {
@@ -53,6 +55,7 @@ impl OpusPorts {
                         if let Err(async_channel::TrySendError::Full(packet)) =
                             encoded.try_send(packet.into())
                         {
+                            encode_counters.encode_drops.fetch_add(1, Ordering::Relaxed);
                             let _ = stale.try_recv();
                             let _ = encoded.try_send(packet);
                         }
@@ -76,7 +79,11 @@ impl OpusPorts {
                 // A malformed network packet is packet loss, not a reason to hang up.
                 if let Ok(samples) = decoder.decode(&frame.data) {
                     decode_counters.decoded.fetch_add(1, Ordering::Relaxed);
-                    let _ = playout.try_send(samples.to_vec());
+                    if playout.try_send(samples.to_vec()).is_err() {
+                        decode_counters
+                            .playout_drops
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 } else {
                     decode_counters
                         .decode_errors
@@ -94,16 +101,18 @@ impl OpusPorts {
     }
 
     pub fn log_flow(&self, audio: &CallAudio) {
-        let (captured_frames, mic_idle_ms, muted) = {
+        let (captured_frames, mic_idle_ms, muted, input_callbacks, capture_drops) = {
             let capture = audio.capture.lock().unwrap_or_else(|p| p.into_inner());
             (
                 capture.captured_frames,
                 capture.last_input.elapsed().as_millis(),
                 capture.muted,
+                capture.input_callbacks,
+                capture.dropped_frames,
             )
         };
         log::info!(
-            "call: audio flow: captured_frames={}, encoded_packets={}, received_packets={}, decoded_frames={}, playout_frames={}, decode_errors={}, mic_idle_ms={}, muted={}",
+            "call: audio flow: captured_frames={}, encoded_packets={}, received_packets={}, decoded_frames={}, playout_frames={}, decode_errors={}, mic_idle_ms={}, muted={}, input_callbacks={}, capture_drops={}, encode_drops={}, playout_drops={}, capture_queue={}, encoded_queue={}, incoming_queue={}, playout_queue={}, encode_task_finished={}, decode_task_finished={}",
             captured_frames,
             self.counters.encoded.load(Ordering::Relaxed),
             self.counters.received.load(Ordering::Relaxed),
@@ -112,6 +121,16 @@ impl OpusPorts {
             self.counters.decode_errors.load(Ordering::Relaxed),
             mic_idle_ms,
             muted,
+            input_callbacks,
+            capture_drops,
+            self.counters.encode_drops.load(Ordering::Relaxed),
+            self.counters.playout_drops.load(Ordering::Relaxed),
+            audio.source.len(),
+            self.source.len(),
+            self.sink.len(),
+            audio.sink.len(),
+            self.tasks[0].is_finished(),
+            self.tasks[1].is_finished(),
         );
     }
 

@@ -533,13 +533,20 @@ async fn set_call_muted(handle: &CallHandle, audio: &CallAudio, muted: bool) -> 
     if !muted && effective {
         log::warn!("call: microphone remains muted because unmute signaling failed or timed out");
     }
+    log::info!("call: mute state: requested={muted}, effective={effective}");
     audio.set_muted(effective);
     effective
 }
 
 async fn close_handle(handle: &CallHandle) {
-    let _ = tokio::time::timeout(Duration::from_secs(2), handle.terminate()).await;
+    log::info!("call: stopping protocol media");
+    let terminated = tokio::time::timeout(Duration::from_secs(2), handle.terminate()).await;
+    log::info!(
+        "call: terminate request finished; timed_out={}",
+        terminated.is_err()
+    );
     handle.hangup_local().await;
+    log::info!("call: protocol media stopped");
 }
 
 fn apply_signal(action: &CallAction, accepted: &mut bool, reason: &mut Option<&'static str>) {

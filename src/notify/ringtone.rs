@@ -27,7 +27,9 @@ impl Ringtone {
     pub fn set_ringing(&mut self, ringing: bool) {
         if !ringing {
             // Closing the channel interrupts the interval and releases the player.
-            self.stop.take();
+            if self.stop.take().is_some() {
+                log::info!("call: ringtone stop requested");
+            }
         } else if self.stop.is_none() {
             let (stop, stopped) = mpsc::channel();
             self.stop = Some(stop);
@@ -43,6 +45,7 @@ impl Ringtone {
                             log::warn!("call: could not open ringtone output");
                             return;
                         };
+                        log::info!("call: ringtone output opened");
                         let player = rodio::Player::connect_new(device.mixer());
                         ring_until_stopped(&stopped, Duration::from_secs(3), || {
                             let decoder = rodio::Decoder::new(std::io::Cursor::new(super::ALERT))
@@ -54,6 +57,9 @@ impl Ringtone {
                             Ok(())
                         });
                         player.stop();
+                        drop(player);
+                        drop(device);
+                        log::info!("call: ringtone output released");
                     });
                 if result.is_err() {
                     log::warn!("call: could not start ringtone thread");

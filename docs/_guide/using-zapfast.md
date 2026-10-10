@@ -306,8 +306,13 @@ when `XDG_STATE_HOME` is set). Save it before restarting,
 which replaces it. Call diagnostics identify incoming-offer filtering, whether
 the account was hidden, audio-device setup, and media-connection failures. They
 also count captured, encoded, received, decoded, and played audio frames and
-report whether the microphone is muted. They do not include caller identities,
-call identifiers, audio, or packet contents.
+report whether the microphone is muted. They also record microphone format and
+callback counts, queue depths and dropped frames, audio task completion, device
+opening and release, ringtone shutdown timing, and microphone recovery. Flow
+counters are cumulative for each call, logged five seconds after protocol setup,
+every ten seconds thereafter, and when that media session ends. Encoding does not prove network delivery,
+and playout counts do not prove the speaker was audible. They do not include
+caller identities, call identifiers, audio, or packet contents.
 Share only the relevant excerpt around an attempt. A decoder warning alone
 does not establish why a call disconnected.
 
