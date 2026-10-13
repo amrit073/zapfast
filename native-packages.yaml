@@ -1,8 +1,8 @@
-# Shared CLI: gem install native-packages --version 0.8.1
+# Shared CLI: gem install native-packages --version 0.9.0
 ---
 schema: 1
 tool:
-  version: 0.8.1
+  version: 0.9.0
   nfpm: 2.47.0
 # Ubuntu 24.04 and Debian 13 use ALSA's t64 package name.
 libraries:
@@ -99,6 +99,26 @@ targets:
     native:
       command: [ruby, packaging/macos/dmg.rb, '@PAYLOAD@', '@PACKAGE@']
       output: 'zapfast-@TAG@-macos-universal.dmg'
+  windows-amd64:
+    platform: windows
+    arch: amd64
+    formats: [msi]
+    input:
+      kind: directory
+      local: dist/windows-input-x86_64-pc-windows-msvc
+    native:
+      command: [ruby, packaging/windows/msi.rb, '@PAYLOAD@', '@PACKAGE@', '@VERSION@']
+      output: 'zapfast-@TAG@-x86_64-pc-windows-msvc.msi'
+  windows-arm64:
+    platform: windows
+    arch: arm64
+    formats: [msi]
+    input:
+      kind: directory
+      local: dist/windows-input-aarch64-pc-windows-msvc
+    native:
+      command: [ruby, packaging/windows/msi.rb, '@PAYLOAD@', '@PACKAGE@', '@VERSION@']
+      output: 'zapfast-@TAG@-aarch64-pc-windows-msvc.msi'
   linux-amd64:
     platform: linux
     arch: amd64

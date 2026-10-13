@@ -40,8 +40,10 @@ check_prefix() {
   test -s "$entry"
   test -s "$prefix/share/icons/hicolor/scalable/apps/zapfast.svg"
 
+  # `%U` stays after the quoted path: it is what passes a `whatsapp://` link
+  # to the binary, which the MimeType line claims this entry handles.
   local expected
-  expected=$(printf 'Exec="%s"' "$(escape_exec "${prefix}/bin/zapfast")")
+  expected=$(printf 'Exec="%s" %%U' "$(escape_exec "${prefix}/bin/zapfast")")
   grep -qxF "$expected" "$entry" || {
     echo "unexpected Exec for prefix: $prefix" >&2
     grep '^Exec=' "$entry" >&2
@@ -70,7 +72,7 @@ test ! -e "$work/elsewhere" || { echo "wrote into XDG_DATA_HOME despite a prefix
 
 # A relative prefix becomes absolute, since a launcher cannot resolve it.
 (cd "$work" && bash "$script_dir/install-user.sh" "$fake" relative >/dev/null)
-grep -qxF "Exec=\"$work/relative/bin/zapfast\"" "$work/relative/share/applications/zapfast.desktop" || {
+grep -qxF "Exec=\"$work/relative/bin/zapfast\" %U" "$work/relative/share/applications/zapfast.desktop" || {
   echo "a relative prefix left a relative Exec" >&2
   exit 1
 }

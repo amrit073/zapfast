@@ -69,7 +69,15 @@ EXEC_PATH="$installed" awk '
     }
     return out "\""
   }
-  /^Exec=/ { print "Exec=" quote(ENVIRON["EXEC_PATH"]); next }
+  # The field codes stay: `%U` is what hands a `whatsapp://` link to the
+  # binary, so dropping it with the command name would break the scheme the
+  # MimeType line claims.
+  /^Exec=/ {
+    rest = $0
+    sub(/^Exec=[^ ]*[ ]*/, "", rest)
+    print "Exec=" quote(ENVIRON["EXEC_PATH"]) (rest ~ /%/ ? " " rest : "")
+    next
+  }
   { print }
 ' "$here/applications/zapfast.desktop" > "$apps_dir/zapfast.desktop"
 

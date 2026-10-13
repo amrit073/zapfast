@@ -475,14 +475,16 @@ pub struct Settings {
     pub app_lock_hash: Option<String>,
     /// How long ZapFast may go unused before the app lock locks it.
     pub app_lock_after: AutoLock,
-    /// Last window size in points, remembered across restarts. `None` uses
-    /// the default size.
+    /// Last window width in logical pixels (points at zoom 1), remembered
+    /// across restarts; see [`fastframe_shell::window::Geometry`]. `None`
+    /// uses the default size.
     pub window_width: Option<f32>,
-    /// Last window height in points. See [`Self::window_width`].
+    /// Last window height in logical pixels. See [`Self::window_width`].
     pub window_height: Option<f32>,
-    /// Last window position in points, as `ViewportBuilder::with_position`
-    /// takes it. `None` lets the window manager place the window, which is
-    /// also the case on Wayland where the position is not known.
+    /// Last window position in logical pixels, as
+    /// `ViewportBuilder::with_position` takes it. `None` lets the window
+    /// manager place the window, which is also the case on Wayland where the
+    /// position is not known.
     pub window_x: Option<f32>,
     /// Last window vertical position. See [`Self::window_x`].
     pub window_y: Option<f32>,
@@ -596,15 +598,24 @@ impl Settings {
             .map(str::to_owned)
     }
 
-    /// The remembered window geometry for the next window.
-    pub fn window_geometry(&self) -> crate::window::Geometry {
-        crate::window::Geometry {
-            width: self.window_width,
-            height: self.window_height,
-            x: self.window_x,
-            y: self.window_y,
+    /// The remembered window geometry for the next window. A size or
+    /// position counts only when both of its values are there.
+    pub fn window_geometry(&self) -> fastframe_shell::window::Geometry {
+        fastframe_shell::window::Geometry {
+            size: self
+                .window_width
+                .zip(self.window_height)
+                .map(<[f32; 2]>::from),
+            position: self.window_x.zip(self.window_y).map(<[f32; 2]>::from),
             maximized: self.window_maximized,
         }
+    }
+
+    /// Stores the window geometry in the settings' own fields.
+    pub fn set_window_geometry(&mut self, geometry: fastframe_shell::window::Geometry) {
+        (self.window_width, self.window_height) = geometry.size.map(|[w, h]| (w, h)).unzip();
+        (self.window_x, self.window_y) = geometry.position.map(|[x, y]| (x, y)).unzip();
+        self.window_maximized = geometry.maximized;
     }
 
     pub fn load(path: &Path) -> Self {
@@ -634,15 +645,10 @@ impl Settings {
         }
     }
 
-    /// Atomically replaces the settings file through a temporary file.
+    /// Replaces the settings file whole, never leaving it half written.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let contents = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, contents)?;
-        std::fs::rename(&temp, path)
+        fastframe_file::write(path, contents)
     }
 
     /// Brings a file written before [`SETTINGS_VERSION`] up to date. Each
@@ -776,13 +782,8 @@ impl AccountSettings {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let contents = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, contents)?;
-        std::fs::rename(&temp, path)
+        fastframe_file::write(path, contents)
     }
 }
 
@@ -835,13 +836,8 @@ impl AccountRoster {
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let contents = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let temp = path.with_extension("json.tmp");
-        std::fs::write(&temp, contents)?;
-        std::fs::rename(&temp, path)
+        fastframe_file::write(path, contents)
     }
 
     pub fn allocate(&mut self) -> crate::model::AccountId {
@@ -909,14 +905,66 @@ mod tests {
     #[test]
     fn the_window_geometry_defaults_to_unset() {
         // Files written before the window was remembered open with the
-        // default size; the full round-trip lives in `window::tests`.
+        // default size.
         let settings = Settings::default();
         assert_eq!(
             settings.window_geometry(),
-            crate::window::Geometry::default()
+            fastframe_shell::window::Geometry::default()
         );
         let older: Settings = serde_json::from_str(r#"{"zoom":1.25}"#).unwrap();
-        assert_eq!(older.window_geometry(), crate::window::Geometry::default());
+        assert_eq!(
+            older.window_geometry(),
+            fastframe_shell::window::Geometry::default()
+        );
+        // Half a size or position is no size or position.
+        let half = Settings {
+            window_width: Some(1280.0),
+            window_x: Some(100.0),
+            ..Settings::default()
+        };
+        assert_eq!(
+            half.window_geometry(),
+            fastframe_shell::window::Geometry::default()
+        );
+    }
+
+    /// The geometry fastframe-shell remembers lands in the settings' own
+    /// fields and comes back from a saved file unchanged.
+    #[test]
+    fn the_window_geometry_round_trips_through_the_settings_file() {
+        let geometry = fastframe_shell::window::Geometry {
+            size: Some([1280.0, 800.0]),
+            position: Some([100.0, 50.0]),
+            maximized: true,
+        };
+        let mut remembered = Settings {
+            zoom: 1.25,
+            ..Settings::default()
+        };
+        remembered.set_window_geometry(geometry);
+        assert_eq!(
+            (
+                remembered.window_width,
+                remembered.window_height,
+                remembered.window_x,
+                remembered.window_y,
+                remembered.window_maximized
+            ),
+            (Some(1280.0), Some(800.0), Some(100.0), Some(50.0), true)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        remembered.save(&path).unwrap();
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded, remembered);
+        assert_eq!(loaded.window_geometry(), geometry);
+
+        // Without a position (Wayland) none is stored.
+        remembered.set_window_geometry(fastframe_shell::window::Geometry {
+            position: None,
+            ..geometry
+        });
+        assert_eq!((remembered.window_x, remembered.window_y), (None, None));
     }
 
     fn load_from(contents: &str) -> (Settings, serde_json::Value) {

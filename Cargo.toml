@@ -98,6 +98,8 @@ arboard = { version = "3", default-features = false, features = ["image-data", "
 mime_guess2 = "2"
 # Emoji names, groups, and shortcodes for picker search.
 emojis = "0.9"
+# Appends the hostname to the device name shown in WhatsApp's Linked Devices.
+gethostname = "1"
 
 # Rasterizes the SVG logo for windows, the tray, and notifications. Already
 # included through egui_extras.
@@ -113,6 +115,9 @@ mp4 = "0.14"
 # merge of upstream RustAudio/rodio#833, which skips the packets of every track
 # but the selected one. Drop the pin at the first release that carries it.
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e89e685d326a684b298c5138adf94caa49e5568c", default-features = false, features = ["playback", "recording", "mp3", "mp4", "wav", "vorbis"] }
+# rodio's own copy, named to decode a video's AAC track that `mp4` reads:
+# symphonia 0.5's MP4 reader refuses the sound of WhatsApp's videos (#265).
+symphonia = { version = "0.5.5", default-features = false, features = ["aac"] }
 opus = "0.4"
 ogg = "0.9"
 # Converts animated Signal APNG stickers to the animated WebP used by WhatsApp.
@@ -123,34 +128,43 @@ libwebp-sys2 = { version = "0.2", features = ["1_2"] }
 # Shared foundation of Carmine's egui apps (github.com/crmne/fastframe). Every
 # crate comes from the same revision.
 # Bundled gettext catalogs: lookups and system language detection.
-fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The icons! table, a loader that survives reduce_texture_memory, and the Lucide
 # icons shared with Spotifast.
-fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The platform's interface font (Inter where there is none), and installed
 # fonts for other scripts.
-fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Colour emoji in the platform's own style, with the bundled Noto behind
 # them, drawn off the interface thread.
-fastframe-emoji = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-emoji = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Follows the desktop's hinting and glyph coverage, live through the portal.
-fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1", features = ["watch"] }
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1", features = ["watch"] }
 # Palette files, the shared presets, and following Omarchy's theme live.
-fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Logs to stderr and a per-run file, and records panics without their payload.
-fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The tray item: StatusNotifier on Linux, tray-icon on Windows and macOS.
-fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
-# Keeps ZapFast running without a window and recovers off-screen windows.
-fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+# Keeps ZapFast running without a window, remembers its geometry, recovers it
+# off screen, and brings it forward on niri.
+fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Centres the macOS traffic lights on ZapFast's own header.
-fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-macos = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # One running copy per user: the lock, and the channel a second launch uses.
-fastframe-instance = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-instance = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # The wheel step, and on Linux touchpad scale, glide and axis lock.
-fastframe-scroll = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-scroll = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+# The desktop entry name (Flatpak-aware), the GNOME check, and GNOME's clock
+# format through the desktop portal.
+fastframe-desktop = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+# Sleep and wake as the system reports them, so the link reconnects after a
+# wake (Linux and Windows).
+fastframe-power = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
+# Saves that are never half written: settings and the chosen wallpaper.
+fastframe-file = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1" }
 # Self-update from GitHub releases with signed checksums, a helper and rollback.
-fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1", features = ["reqwest"] }
+fastframe-update = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1", features = ["reqwest"] }
 
 [patch.crates-io]
 # crmne/egui apps-0.36, shared with Spotifast, RekordFlash and TonePush: egui
@@ -210,6 +224,9 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSText", "NSView", "NSWindow"] }
 # Reads the locale's clock format.
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSDateFormatter", "NSFormatter", "NSLocale", "NSString"] }
+# Notifications through UNUserNotificationCenter: notify-rust's macOS backend
+# cannot stop waiting for a click, so released ones would pile up.
+mac-usernotifications = "0.3.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-native-keyring-store = { version = "1.1", default-features = false }
@@ -261,4 +278,4 @@ opt-level = 2
 [build-dependencies]
 # Compiles the PO catalogs to Rust, leaving out unfinished entries. Ordinary
 # builds do not need gettext tools.
-fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1", features = ["build"] }
+fastframe-i18n = { git = "https://github.com/crmne/fastframe", tag = "v0.5.1", features = ["build"] }

@@ -17,7 +17,7 @@ pub(crate) mod sticker_import;
 mod sticker_maker;
 pub(crate) mod sticker_store;
 mod worker;
-pub use worker::{PINNED_CHATS, PLUS_PINNED_CHATS};
+pub use worker::{PINNED_CHATS, PLUS_PINNED_CHATS, host_owned_presence};
 
 /// Result of a deletion request, without protocol errors crossing the bridge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -263,6 +263,11 @@ pub enum Command {
         chat: ChatId,
         message: String,
     },
+    /// Downloads a motion photo's clip.
+    DownloadMotion {
+        chat: ChatId,
+        message: String,
+    },
     /// Requests a profile picture; `full` selects the info-dialog size.
     FetchAvatar {
         id: String,
@@ -479,6 +484,9 @@ pub enum Command {
     /// Whether archived chats stay archived when a new message arrives or is
     /// sent; when not, a new message unarchives the chat here.
     SetKeepChatsArchived(bool),
+    /// The machine woke up from sleep: a link open across it can still look
+    /// established while nothing arrives, so reconnect it now.
+    Resumed,
     /// Asks where to save a copy of an attachment, then copies it there.
     SaveAttachmentAs {
         source: std::path::PathBuf,
@@ -661,6 +669,12 @@ pub enum Command {
     /// Internal attachment-download result.
     Downloaded {
         card: Option<usize>,
+        chat: ChatId,
+        id: String,
+        result: Result<PathBuf, String>,
+    },
+    /// Internal motion-clip download result.
+    MotionDownloaded {
         chat: ChatId,
         id: String,
         result: Result<PathBuf, String>,
@@ -917,6 +931,12 @@ pub enum Event {
     },
     Media {
         card: Option<usize>,
+        chat: ChatId,
+        message: String,
+        result: Result<PathBuf, String>,
+    },
+    /// A motion photo's clip finished downloading, or failed.
+    Motion {
         chat: ChatId,
         message: String,
         result: Result<PathBuf, String>,

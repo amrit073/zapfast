@@ -73,7 +73,7 @@ struct Cli {
     #[arg(long, requires = "demo")]
     demo_macos: bool,
 
-    /// Demo view: `chat`, `empty`, `settings`, `login`,
+    /// Demo view: `chat`, `phone-menu`, `empty`, `settings`, `login`,
     /// `pair`, `shortcuts`, `about`, `info`, `mention`, `light`, or a comma-separated
     /// mix such as `chat,light`.
     #[cfg(feature = "demo")]
@@ -87,6 +87,11 @@ struct Cli {
     /// Screenshot window size as WxH logical points.
     #[arg(long, value_name = "WxH")]
     demo_size: Option<String>,
+
+    /// A number, a `wa.me` link, or a `whatsapp://` URI naming the chat to
+    /// open. Brings the running copy's window forward on that chat.
+    #[arg(value_name = "TARGET")]
+    target: Option<String>,
 
     /// Delay before taking the screenshot, in milliseconds.
     #[cfg(feature = "demo")]
@@ -120,7 +125,10 @@ fn default_log_filter(verbose: bool) -> &'static str {
     if verbose {
         "info,zapfast=debug,whatsapp_rust=debug,wacore=debug"
     } else {
-        "warn,zapfast=info,fastframe_fonts=info,arboard=error"
+        // env_logger treats '/' as a message-regex separator, so it cannot
+        // select the literal target Client/AppState here. Enable Client INFO;
+        // the protocol redactor reduces every such line to a fixed category.
+        "warn,zapfast=info,fastframe_fonts=info,Client=info,arboard=error"
     }
 }
 
@@ -158,6 +166,16 @@ fn run() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    // A number, a `wa.me` link, or the `whatsapp://` URI the desktop entry
+    // passes. Read before the single-instance guard, because it changes the
+    // verb: a running copy is asked to open the chat instead of to show.
+    let target = cli.target.as_deref().and_then(zapfast::target::parse);
+    if let Some(argument) = cli.target.as_deref()
+        && target.is_none()
+    {
+        eprintln!("ZapFast cannot read a phone number from {argument}");
+        std::process::exit(2);
+    }
     let waker = backend::Waker::default();
     #[cfg(feature = "demo")]
     let demo = cli.demo || cli.demo_shot.is_some() || cli.demo_tour;
@@ -168,15 +186,26 @@ fn run() -> eframe::Result<()> {
         None
     } else {
         // A hidden start must not surface a copy that is already running.
-        let verb = if cli.start_hidden { "ping" } else { "show" };
-        match single_instance::acquire(&discovered.runtime, &waker, verb) {
+        let verb = match &target {
+            Some(request) => request.verb(),
+            None if cli.start_hidden => "ping".to_owned(),
+            None => "show".to_owned(),
+        };
+        match single_instance::acquire(&discovered.runtime, &waker, &verb) {
             single_instance::Outcome::Only(guard) => Some(guard),
-            single_instance::Outcome::Surfaced if cli.start_hidden => {
+            single_instance::Outcome::Surfaced if cli.start_hidden && target.is_none() => {
                 eprintln!("ZapFast is already running");
                 return Ok(());
             }
             single_instance::Outcome::Surfaced => {
-                eprintln!("ZapFast or FastsApp is already running; asked it to show its window");
+                eprintln!(
+                    "ZapFast or FastsApp is already running; asked it to {}",
+                    if target.is_some() {
+                        "open the chat"
+                    } else {
+                        "show its window"
+                    }
+                );
                 return Ok(());
             }
             single_instance::Outcome::Unanswered => {
@@ -244,6 +273,20 @@ fn run() -> eframe::Result<()> {
     if let Some(guard) = &instance {
         app.set_remote_control(guard);
     }
+    // The first launch owns the slot, so no verb reached a running copy and
+    // the chat is opened here. The app drains its queue after the frame.
+    if let Some(request) = &target {
+        app.actions.push(zapfast::model::Action::StartChat {
+            name: request.display_name(),
+            id: request.chat.clone(),
+        });
+        if let Some(text) = &request.text {
+            app.actions.push(zapfast::model::Action::PrefillComposer {
+                chat: request.chat.clone(),
+                text: text.clone(),
+            });
+        }
+    }
     #[cfg(feature = "demo")]
     if demo {
         zapfast::demo::populate(&mut app);
@@ -263,11 +306,23 @@ fn run() -> eframe::Result<()> {
         let (x, y) = value.split_once(',')?;
         Some(egui::pos2(x.trim().parse().ok()?, y.trim().parse().ok()?))
     });
+    #[cfg(feature = "demo")]
+    let demo_phone_menu = cli
+        .demo_page
+        .as_deref()
+        .is_some_and(|page| page.split(',').any(|part| part.trim() == "phone-menu"));
     let mut update_receipt = launch.receipt;
     // The link, archive, and tray outlive windows. The shell recreates a
     // window when the tray, a notification, or another launch requests one;
     // without a tray a hidden start shows the window (App::start_hidden).
-    let start_hidden = cli.start_hidden && !demo && update_receipt.is_none();
+    // A link asked to be seen, so it overrides a hidden start: the chat it
+    // named would otherwise open behind a tray nobody is looking at.
+    let start_hidden = start_hidden(
+        cli.start_hidden,
+        target.is_some(),
+        demo,
+        update_receipt.is_some(),
+    );
     fastframe_shell::Shell::new(app, &waker)
         .start_hidden(start_hidden)
         .idle(fastframe_tray::idle)
@@ -278,7 +333,7 @@ fn run() -> eframe::Result<()> {
             // what the last one remembered, not what the process started
             // with. Demo runs keep their fixed screenshot size.
             let geometry = if demo_persistence.is_some() {
-                zapfast::window::Geometry::default()
+                fastframe_shell::window::Geometry::default()
             } else {
                 lease.peek(|app: &app::App| app.settings.window_geometry())
             };
@@ -318,6 +373,8 @@ fn run() -> eframe::Result<()> {
                         shot,
                         #[cfg(feature = "demo")]
                         hover: demo_hover,
+                        #[cfg(feature = "demo")]
+                        open_phone_menu: demo_phone_menu,
                         #[cfg(feature = "demo")]
                         tour,
                     }))
@@ -398,6 +455,15 @@ fn redact_protocol(
     .then(|| protocol_summary(message))
 }
 
+/// Whether the first window starts in the tray.
+///
+/// A link overrides a hidden start: the chat it named would otherwise open
+/// behind a tray nobody is looking at. A demo and an update receipt have
+/// their own reasons to keep it hidden.
+fn start_hidden(requested: bool, has_target: bool, demo: bool, receipt: bool) -> bool {
+    requested && !has_target && !demo && !receipt
+}
+
 /// Parses `--demo-size WxH`.
 fn demo_size_arg() -> Option<[f32; 2]> {
     let value = std::env::args()
@@ -415,7 +481,7 @@ fn tour_script(name: &str) -> zapfast::demo::tour::Script {
 
 fn native_options(
     demo_persistence: Option<std::path::PathBuf>,
-    geometry: zapfast::window::Geometry,
+    geometry: fastframe_shell::window::Geometry,
 ) -> eframe::NativeOptions {
     let default_size = demo_size_arg().unwrap_or([1180.0, 780.0]);
     let demo = demo_persistence.is_some();
@@ -424,15 +490,15 @@ fn native_options(
         .with_app_id(if demo {
             "zapfast-demo".to_owned()
         } else {
-            std::env::var("FLATPAK_ID").unwrap_or_else(|_| "zapfast".to_owned())
+            fastframe_desktop::desktop_entry("zapfast")
         });
-    // The remembered size and position, from the settings. eframe's own
-    // stored window (when present from an earlier version) still wins over
-    // this, and is then remembered here on the first frame.
+    // The remembered size and position, from the settings, over the default
+    // size. Demo runs keep their fixed screenshot size.
+    let viewport = viewport.with_inner_size(default_size);
     let viewport = if demo {
-        viewport.with_inner_size(default_size)
+        viewport
     } else {
-        zapfast::window::viewport(viewport, geometry, default_size)
+        geometry.apply(viewport)
     };
     let viewport = viewport
         // Keep the floor small enough that Windows can still snap the window
@@ -447,8 +513,11 @@ fn native_options(
     eframe::NativeOptions {
         viewport,
         persistence_path: demo_persistence,
-        // Do not restore window size during fixed-size screenshot runs.
-        persist_window: !demo,
+        // The settings remember the window (fastframe_shell::window::Geometry),
+        // in logical pixels. eframe's own copy is in points at the zoom of the
+        // time, and opened smaller at every launch with the interface zoomed,
+        // since its zoom comes back only once the window exists.
+        persist_window: false,
         ..Default::default()
     }
 }
@@ -469,6 +538,8 @@ struct Shell {
     tour: Option<zapfast::demo::tour::Tour>,
     #[cfg(feature = "demo")]
     hover: Option<egui::Pos2>,
+    #[cfg(feature = "demo")]
+    open_phone_menu: bool,
 }
 
 /// Pending screenshot request.
@@ -534,8 +605,9 @@ impl eframe::App for Shell {
         }
     }
 
-    /// Does not persist egui interaction state across windows. Window size and
-    /// position are still persisted.
+    /// Does not persist egui interaction state across windows. The zoom and
+    /// the window's geometry live in the settings: egui's memory would bring
+    /// back a zoom that scales the remembered geometry a second time.
     fn persist_egui_memory(&self) -> bool {
         false
     }
@@ -550,6 +622,7 @@ impl eframe::App for Shell {
             tour.drive(app, ctx);
         }
         app.background_frame(ctx);
+        app.window_logic(ctx);
         #[cfg(target_os = "windows")]
         if let (Some(window), Some(count)) = (frame.winit_window(), app.taskbar_badge_count())
             && let Some(at) = self.taskbar.show(window, count, app.locale)
@@ -581,6 +654,10 @@ impl eframe::App for Shell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let app = &mut *self.app;
+        #[cfg(feature = "demo")]
+        if std::mem::take(&mut self.open_phone_menu) {
+            egui::Popup::open_id(ui.ctx(), zapfast::demo::phone_menu_popup_id());
+        }
         app.frame_ui(ui);
         let startups: Vec<_> = app
             .accounts
@@ -635,6 +712,94 @@ fn app_icon() -> egui::IconData {
             width: SIZE as u32,
             height: SIZE as u32,
         }
+    }
+}
+
+#[cfg(test)]
+mod target_cli_tests {
+    use super::*;
+
+    /// The argument the desktop entry's `%U` passes, and the shapes a reader
+    /// types or pastes, all reach the same chat.
+    #[test]
+    fn a_target_argument_names_a_chat() {
+        for argument in [
+            "whatsapp://send?phone=20123456789",
+            "https://wa.me/20123456789",
+            "+20123456789",
+        ] {
+            let cli = Cli::try_parse_from(["zapfast", argument]).unwrap();
+            let request = zapfast::target::parse(cli.target.as_deref().unwrap()).unwrap();
+            assert_eq!(request.chat, "20123456789@s.whatsapp.net", "{argument}");
+            assert_eq!(request.text, None, "{argument}");
+        }
+    }
+
+    /// A share link's template reaches the app decoded, both through the
+    /// first launch's own queue and over the socket to a running copy.
+    #[test]
+    fn a_target_argument_carries_its_template() {
+        let cli = Cli::try_parse_from([
+            "zapfast",
+            "whatsapp://send?phone=20123456789&text=Hi%20there",
+        ])
+        .unwrap();
+        let request = zapfast::target::parse(cli.target.as_deref().unwrap()).unwrap();
+        assert_eq!(request.text.as_deref(), Some("Hi there"));
+        // What the second launch sends is what the running copy reads back.
+        let verb = request.verb();
+        assert!(verb.starts_with("open 20123456789@s.whatsapp.net\t"));
+        assert_eq!(
+            zapfast::target::Request::from_verb(verb.strip_prefix("open ").unwrap()),
+            Some(request)
+        );
+    }
+
+    /// `reload-themes` is a subcommand and a number is not: clap must not
+    /// read one as the other. The subcommand takes no chat, so asking for
+    /// both is refused rather than half-honoured.
+    #[test]
+    fn the_subcommand_and_the_target_stay_apart() {
+        assert!(matches!(
+            Cli::try_parse_from(["zapfast", "reload-themes"])
+                .unwrap()
+                .command,
+            Some(Control::ReloadThemes)
+        ));
+        assert!(Cli::try_parse_from(["zapfast", "reload-themes", "20123456789"]).is_err());
+        let cli = Cli::try_parse_from(["zapfast", "wa.me/20123456789"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.target.as_deref(), Some("wa.me/20123456789"));
+    }
+
+    /// A launch with nothing to open still works: the target is optional.
+    #[test]
+    fn a_launch_without_a_target_still_parses() {
+        let cli = Cli::try_parse_from(["zapfast"]).unwrap();
+        assert!(cli.target.is_none());
+        let cli = Cli::try_parse_from(["zapfast", "--start-hidden"]).unwrap();
+        assert!(cli.start_hidden);
+        assert!(cli.target.is_none());
+    }
+
+    /// A link asked to be seen: `--start-hidden` with a chat to open must not
+    /// leave the chat behind a tray nobody is looking at.
+    #[test]
+    fn a_link_overrides_a_hidden_start() {
+        assert!(!start_hidden(true, true, false, false), "a link is shown");
+        assert!(
+            start_hidden(true, false, false, false),
+            "autostart stays hidden"
+        );
+        assert!(!start_hidden(false, false, false, false));
+        assert!(
+            !start_hidden(true, false, true, false),
+            "a demo is its own run"
+        );
+        assert!(
+            !start_hidden(true, false, false, true),
+            "an update is not seen"
+        );
     }
 }
 
@@ -783,6 +948,47 @@ mod log_filter_tests {
             log::Level::Debug,
             "fastframe_fonts::system"
         ));
+    }
+
+    #[test]
+    fn default_log_records_protocol_recovery_lifecycle_and_redacts_other_client_info() {
+        let filter = default_log_filter(false);
+        assert!(matches(filter, log::Level::Info, "Client/AppState"));
+        assert!(!matches(filter, log::Level::Info, "AppState"));
+        // env_logger cannot select a literal target containing '/'. The
+        // broader Client INFO target must remain inside the redaction boundary.
+        assert!(matches(filter, log::Level::Info, "Client/Message"));
+        let record = log::Record::builder()
+            .level(log::Level::Info)
+            .target("Client/Message")
+            .module_path(Some("whatsapp_rust::client::message"))
+            .args(format_args!("private"))
+            .build();
+        assert_eq!(
+            redact_protocol(&record, "private 12345@s.whatsapp.net"),
+            Some(std::borrow::Cow::Borrowed(
+                "protocol diagnostic (private details omitted)"
+            ))
+        );
+    }
+
+    #[test]
+    fn app_state_info_is_redacted_even_with_a_custom_log_target() {
+        let record = log::Record::builder()
+            .args(format_args!("private 12345@s.whatsapp.net"))
+            .level(log::Level::Info)
+            .target("Client/AppState")
+            .module_path(Some("whatsapp_rust::client::app_state"))
+            .build();
+        assert_eq!(
+            redact_protocol(
+                &record,
+                "Recovered the regular_low collection from the primary device: 12345@s.whatsapp.net"
+            ),
+            Some(std::borrow::Cow::Borrowed(
+                "app-state regular_low recovery reply applied by library"
+            ))
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     }
     let editing_text = ctx.text_edit_focused();
     let find = find_action(app);
+    let archive = archive_action(app);
+    let next_account = next_account_action(app);
     let mut actions = Vec::new();
     ctx.input_mut(|input| {
         let mut key = |modifiers: Modifiers, key: Key, action: Action| {
@@ -39,6 +41,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             );
         }
         key(Modifiers::COMMAND, Key::K, Action::FocusSearch);
+        if let Some(next_account) = next_account {
+            key(Modifiers::COMMAND | Modifiers::SHIFT, Key::A, next_account);
+        }
         if app.is_linked() {
             key(
                 Modifiers::COMMAND,
@@ -62,6 +67,9 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             && app.recording.is_none()
         {
             key(Modifiers::COMMAND, Key::L, Action::FocusComposer);
+        }
+        if let Some(archive) = archive {
+            key(Modifiers::COMMAND, Key::E, archive);
         }
         key(Modifiers::COMMAND, Key::B, Action::ToggleSidebar);
         key(Modifiers::COMMAND, Key::Comma, Action::ToggleSettings);
@@ -411,6 +419,40 @@ fn find_action(app: &App) -> Action {
     }
 }
 
+/// Ctrl+E archives the open chat, or unarchives an archived one, as in
+/// WhatsApp. Archiving closes the chat, as the chat menus do.
+fn archive_action(app: &App) -> Option<Action> {
+    if app.page != Page::Chats
+        || app.dialog.is_some()
+        || app.show_update
+        || app.picker.is_some()
+        || app.reaction_target.is_some()
+        || app.recording.is_some()
+    {
+        return None;
+    }
+    let chat = app.chat(app.open_chat.as_deref()?)?;
+    Some(Action::SetArchived(chat.id.clone(), !chat.archived))
+}
+
+/// Ctrl+Shift+A shows the next linked number, in the switcher's order and
+/// wrapping after the last. An account still being added is left through
+/// its own Cancel, not by this shortcut.
+fn next_account_action(app: &App) -> Option<Action> {
+    if !app.has_several_accounts()
+        || app.adding_account
+        || app.dialog.is_some()
+        || app.show_update
+        || app.picker.is_some()
+        || app.reaction_target.is_some()
+        || app.recording.is_some()
+    {
+        return None;
+    }
+    let next = (app.active + 1) % app.accounts.len();
+    Some(Action::SwitchAccount(app.accounts[next].id.clone()))
+}
+
 /// Shortcuts shown in the help dialog.
 pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+K / Ctrl+Shift+F", "Search chats"),
@@ -430,6 +472,8 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
         "Dismiss the current action, return from search, or close the chat",
     ),
     ("Ctrl+N", "New chat or message yourself"),
+    ("Ctrl+E", "Archive or unarchive the open chat"),
+    ("Ctrl+Shift+A", "Switch to the next linked number"),
     (
         "Ctrl+V",
         "Paste text, or stage a picture from the clipboard",
@@ -867,6 +911,123 @@ mod tests {
         app.show_update = false;
         app.reaction_target = Some(("chat-fixture".into(), "message-fixture".into()));
         assert!(press(&mut app, &ctx, Key::Num1, Modifiers::COMMAND));
+        assert!(app.actions.is_empty());
+    }
+
+    /// One number on screen and a second linked beside it.
+    fn app_with_two_numbers() -> (tempfile::TempDir, App) {
+        let root = tempfile::tempdir().unwrap();
+        let dirs = crate::paths::AppDirs::under(root.path());
+        let mut app = App::headless(dirs.clone(), crate::settings::Settings::default()).0;
+        let second = crate::account::Account::detached(
+            &dirs,
+            crate::model::AccountId::parse("2").unwrap(),
+            crate::settings::AccountSettings::default(),
+        )
+        .unwrap()
+        .0;
+        app.accounts.push(second);
+        app.active = 0;
+        app.page = Page::Chats;
+        (root, app)
+    }
+
+    #[test]
+    fn ctrl_shift_a_steps_through_linked_numbers_and_wraps() {
+        let (_root, mut app) = app_with_two_numbers();
+        let ids: Vec<_> = app
+            .accounts
+            .iter()
+            .map(|account| account.id.clone())
+            .collect();
+        let ctx = egui::Context::default();
+        for modifiers in ctrl_shift() {
+            for (active, expected) in [(0, &ids[1]), (1, &ids[0])] {
+                app.active = active;
+                app.actions.clear();
+                assert!(!press(&mut app, &ctx, Key::A, modifiers));
+                assert_eq!(app.actions, [Action::SwitchAccount(expected.clone())]);
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_shift_a_needs_a_second_number_that_is_not_being_added() {
+        let (_root, mut single, _ids) = app_with_chats(1);
+        let ctx = egui::Context::default();
+        let ctrl_shift_a = Modifiers::COMMAND | Modifiers::SHIFT;
+        assert!(press(&mut single, &ctx, Key::A, ctrl_shift_a));
+        assert!(
+            single.actions.is_empty(),
+            "one number has nothing to switch to"
+        );
+        let (_root, mut app) = app_with_two_numbers();
+        app.adding_account = true;
+        assert!(press(&mut app, &ctx, Key::A, ctrl_shift_a));
+        assert!(
+            app.actions.is_empty(),
+            "a number being added keeps its Cancel"
+        );
+    }
+
+    #[test]
+    fn ctrl_shift_a_leaves_dialogs_and_other_combinations_alone() {
+        let (_root, mut app) = app_with_two_numbers();
+        let ctx = egui::Context::default();
+        app.dialog = Some(Dialog::Shortcuts);
+        assert!(press(
+            &mut app,
+            &ctx,
+            Key::A,
+            Modifiers::COMMAND | Modifiers::SHIFT
+        ));
+        app.dialog = None;
+        for modifiers in [Modifiers::NONE, Modifiers::SHIFT, Modifiers::COMMAND] {
+            assert!(press(&mut app, &ctx, Key::A, modifiers));
+        }
+        assert!(
+            !app.actions
+                .iter()
+                .any(|action| matches!(action, Action::SwitchAccount(_))),
+            "{:?}",
+            app.actions
+        );
+    }
+
+    #[test]
+    fn ctrl_e_archives_and_unarchives_the_open_chat() {
+        let (_root, mut app, ids) = app_with_chats(2);
+        app.open_chat = Some(ids[1].clone());
+        let ctx = egui::Context::default();
+        for modifiers in ctrl_shift().map(|modifiers| Modifiers {
+            shift: false,
+            ..modifiers
+        }) {
+            app.chats[1].archived = false;
+            app.actions.clear();
+            assert!(!press(&mut app, &ctx, Key::E, modifiers));
+            assert_eq!(app.actions, [Action::SetArchived(ids[1].clone(), true)]);
+            app.chats[1].archived = true;
+            app.actions.clear();
+            assert!(!press(&mut app, &ctx, Key::E, modifiers));
+            assert_eq!(app.actions, [Action::SetArchived(ids[1].clone(), false)]);
+        }
+    }
+
+    #[test]
+    fn ctrl_e_needs_an_open_chat_and_no_overlay() {
+        let (_root, mut app, ids) = app_with_chats(1);
+        let ctx = egui::Context::default();
+        assert!(press(&mut app, &ctx, Key::E, Modifiers::COMMAND));
+        assert!(app.actions.is_empty(), "no chat is open");
+        app.open_chat = Some(ids[0].clone());
+        app.dialog = Some(Dialog::Shortcuts);
+        assert!(press(&mut app, &ctx, Key::E, Modifiers::COMMAND));
+        app.dialog = None;
+        app.page = Page::Settings;
+        assert!(press(&mut app, &ctx, Key::E, Modifiers::COMMAND));
+        app.page = Page::Chats;
+        assert!(press(&mut app, &ctx, Key::E, Modifiers::NONE));
         assert!(app.actions.is_empty());
     }
 

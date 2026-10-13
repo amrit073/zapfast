@@ -235,6 +235,10 @@ pub struct AppLock {
     pub forgetting: Forgetting,
     /// A notification clicked while locked, opened once unlocked.
     pub deferred: Option<crate::notify::NotificationTarget>,
+    /// A chat a link asked for while locked, opened once unlocked. A link
+    /// names a chat the lock would otherwise hide, so it waits rather than
+    /// being dropped: the reader asked for it from outside.
+    pub deferred_request: Option<crate::target::Request>,
     /// The Settings password form, when open.
     pub form: Option<Form>,
 }
@@ -263,6 +267,7 @@ impl AppLock {
             wrong: false,
             forgetting: Forgetting::No,
             deferred: None,
+            deferred_request: None,
             form: None,
         }
     }

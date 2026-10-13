@@ -17,6 +17,7 @@ use crate::model::{
     Label, Media, MediaState, Message, Page, PickerTab, Scroll, SidebarDisplayMode, StickerPack,
     StickerShelf, Toast, ToastKind,
 };
+use crate::nav::{History, Location};
 use crate::paths::AppDirs;
 use crate::settings::{AccountRoster, NotificationSound, Settings, ThemeChoice};
 use crate::single_instance::{ControlCommand, Guard};
@@ -500,6 +501,8 @@ pub struct App {
     pub image_preview: Option<PreviewState>,
     /// Whether the loaded video covers the window instead of its bubble.
     pub video_expanded: bool,
+    /// The motion photo whose clip plays over it: its chat and message.
+    pub motion_playing: Option<(ChatId, String)>,
     /// Message bodies registered for transcript copy formatting.
     pub copy_rows: std::sync::Arc<std::sync::Mutex<Vec<crate::transcript::Row>>>,
     /// Previous message-list rect used by the selection hook.
@@ -533,6 +536,9 @@ pub struct App {
 
     pub page: Page,
     pub dialog: Option<Dialog>,
+    /// Places visited in this window, for the mouse's back and forward
+    /// buttons. Cleared when the account on screen changes.
+    nav_history: History,
     /// Chat filter in the forwarding destination dialog.
     pub forward_search: String,
     /// The group name being typed in the group info dialog.
@@ -552,6 +558,10 @@ pub struct App {
     unread_kept: HashSet<ChatId>,
     pub toasts: Vec<Toast>,
     pub actions: Vec<Action>,
+    /// Text a link put in the composer, with the chat it belongs to. Text the
+    /// reader never changed is not their draft, so a chat they leave does not
+    /// store it in place of the one they wrote.
+    prefilled: Option<(ChatId, String)>,
     /// Actions queued by a backend event, applied on that account after the frame.
     deferred_account_actions: Vec<(AccountId, Action)>,
     /// Set while the events of an account that is not on screen are being
@@ -599,10 +609,17 @@ pub struct App {
     /// Cross-thread window repaint handle.
     waker: Waker,
     tray: Option<fastframe_tray::Tray>,
+    /// Sleep and wake as the system reports them. Tests and demo runs get a
+    /// fixed one that reads nothing from the machine.
+    power: fastframe_power::Power,
     /// Stands in for whether a panel shows the tray item, which tests cannot
     /// spawn.
     #[cfg(test)]
     test_tray_shown: Option<bool>,
+    /// Stands in for the compositor raising the window, so tests never run
+    /// its command line tool.
+    #[cfg(test)]
+    test_raised: bool,
     /// Whether the tray menu offers "Lock ZapFast": whether an app lock
     /// password was set when it last changed.
     tray_lockable: bool,
@@ -877,13 +894,15 @@ impl App {
             .name("text-rendering".into())
             .spawn(move || crate::theme::follow_text_rendering(move || text_waker.wake()))
             .ok();
+        let power_waker = waker.clone();
+        app.power = fastframe_power::Power::spawn(move || power_waker.wake());
         if options.tray {
             let waker = waker.clone();
             app.tray =
                 fastframe_tray::Tray::spawn(tray_config(app.tray_lockable), move || waker.wake());
         }
-        // The clock preference may run a helper on Linux; keep it off the
-        // first frame.
+        // The clock preference may wait on the desktop portal on Linux; keep
+        // it off the first frame.
         std::thread::Builder::new()
             .name("clock-format".into())
             .spawn(|| {
@@ -1074,6 +1093,7 @@ impl App {
             pauses_media: false,
             image_preview: None,
             video_expanded: false,
+            motion_playing: None,
             copy_rows: Default::default(),
             selection_view: Default::default(),
             gif_query: String::new(),
@@ -1092,6 +1112,7 @@ impl App {
             scroll_route: ScrollRoute::default(),
             page: Page::Chats,
             dialog: None,
+            nav_history: History::default(),
             forward_search: String::new(),
             group_name_edit: None,
             new_contact_to_phone: true,
@@ -1103,6 +1124,7 @@ impl App {
             unread_kept: HashSet::new(),
             toasts: Vec::new(),
             actions: Vec::new(),
+            prefilled: None,
             deferred_account_actions: Vec::new(),
             events_hidden: false,
             update: None,
@@ -1128,8 +1150,11 @@ impl App {
             start_with_system: None,
             waker,
             tray: None,
+            power: fastframe_power::Power::fixed(Default::default()),
             #[cfg(test)]
             test_tray_shown: None,
+            #[cfg(test)]
+            test_raised: false,
             tray_lockable,
             window_hidden: false,
             hide_intent: false,
@@ -1197,10 +1222,23 @@ impl App {
         }
     }
 
+    /// Text a link put in the composer, and the reader never changed. It is
+    /// not their unsent text, so no path that saves the composer may keep it:
+    /// the draft they wrote stays theirs.
+    fn is_untouched_prefill(&self, chat: &str, text: &str) -> bool {
+        self.prefilled
+            .as_ref()
+            .is_some_and(|(prefilled_chat, prefilled)| prefilled_chat == chat && prefilled == text)
+    }
+
     fn park_composer(&mut self) {
         if let Some(previous) = self.open_chat.clone() {
             let draft = std::mem::take(&mut self.composer);
-            if self.editing.take().is_some() || draft.trim().is_empty() {
+            if self.is_untouched_prefill(&previous, &draft) {
+                // A link's text is not the reader's, so the draft they wrote
+                // stays exactly as it was.
+                self.composer_mentions.clear();
+            } else if self.editing.take().is_some() || draft.trim().is_empty() {
                 self.drafts.remove(&previous);
                 self.draft_mentions.remove(&previous);
                 self.composer_mentions.clear();
@@ -1221,6 +1259,8 @@ impl App {
     }
 
     fn restore_composer(&mut self) {
+        // Whatever the composer held is not a link's text any more.
+        self.prefilled = None;
         if let Some(id) = self.open_chat.clone() {
             self.composer = self.drafts.remove(&id).unwrap_or_default();
             self.composer_mentions = self.draft_mentions.remove(&id).unwrap_or_default();
@@ -1253,6 +1293,9 @@ impl App {
         self.save_roster();
         self.wallpaper_image.reload();
         self.report_presence();
+        // Chats belong to the account that owns them; another account's chat
+        // cannot be restored into this one.
+        self.nav_history.clear();
     }
 
     /// Drops App-owned pointers into the previous account's chats and media.
@@ -1290,6 +1333,7 @@ impl App {
         self.video.stop();
         self.video_chat = None;
         self.video_wanted = None;
+        self.motion_playing = None;
         self.voice_chat = None;
         self.voice_wanted = None;
         self.recording = None;
@@ -1336,6 +1380,7 @@ impl App {
         self.restore_composer();
         self.save_roster();
         self.report_presence();
+        self.nav_history.clear();
     }
 
     /// Unlinks an account and, once its backend has stopped, deletes its
@@ -1394,6 +1439,7 @@ impl App {
             self.restore_composer();
             self.page = Page::Chats;
             self.wallpaper_image.reload();
+            self.nav_history.clear();
         }
         self.save_roster();
         self.report_presence();
@@ -1441,6 +1487,15 @@ impl App {
     /// Whether window close keeps the app in the tray.
     pub fn hides_to_tray(&self) -> bool {
         self.tray_shown() && self.settings.keep_running_in_background
+    }
+
+    /// Asks the compositor to bring the existing window forward, which niri
+    /// can do on Wayland; see [`fastframe_shell::window::raise_on_compositor`].
+    fn raise_on_compositor(&self) -> bool {
+        #[cfg(test)]
+        return self.test_raised;
+        #[cfg(not(test))]
+        fastframe_shell::window::raise_on_compositor()
     }
 
     /// Whether a panel shows the tray item now, so a hidden window can be
@@ -1494,6 +1549,21 @@ impl App {
                 ControlCommand::Show => self.actions.push(Action::ShowWindow),
                 ControlCommand::ReloadThemes => self.actions.push(Action::ReloadThemes),
                 ControlCommand::Ping => {}
+                ControlCommand::OpenChat(request) => {
+                    // The chat is only visible in a window, so a run
+                    // started into the tray shows one first.
+                    self.actions.push(Action::ShowWindow);
+                    self.actions.push(Action::StartChat {
+                        name: request.display_name(),
+                        id: request.chat.clone(),
+                    });
+                    if let Some(text) = request.text {
+                        self.actions.push(Action::PrefillComposer {
+                            chat: request.chat.clone(),
+                            text,
+                        });
+                    }
+                }
             }
         }
     }
@@ -1633,7 +1703,8 @@ impl App {
             .collect();
         let is_us = |id: &str| ours.contains(&id);
         let mentioned = message.mentions.iter().any(|mention| {
-            is_us(&mention.id)
+            crate::mentions::is_everyone(mention)
+                || is_us(&mention.id)
                 || ours
                     .iter()
                     .any(|id| id.split('@').next() == Some(mention.user.as_str()))
@@ -1733,6 +1804,11 @@ impl App {
         self.leave_chat(id);
         self.chats.retain(|chat| chat.id != id);
         self.conversations.remove(id);
+        // The recorded places belong to the account on screen, and chat ids
+        // repeat across accounts.
+        if !self.events_hidden {
+            self.nav_history.forget(id);
+        }
         self.drafts.remove(id);
         self.draft_mentions.remove(id);
         self.typing.remove(id);
@@ -1910,6 +1986,9 @@ impl App {
 
     /// Resolves a mention name without replacing our own name with "You".
     pub fn mention_name(&self, id: &str) -> String {
+        if id == crate::mentions::ALL_ID {
+            return crate::mentions::ALL_USER.to_owned();
+        }
         if self.me.as_deref() == Some(id) {
             return self
                 .me_name
@@ -1991,13 +2070,20 @@ impl App {
         if let Some(name) = saved.or_else(|| called.map(|name| format!("~{name}"))) {
             return name;
         }
+        // A name of digits alone is no name. When the id carries the number,
+        // neither is one as `util::phone` grouped it when the chat was filed:
+        // that is formatted afresh from the id.
+        let phone = crate::model::phone_of(id);
+        let number = |c: char| {
+            c.is_ascii_digit() || (phone.is_some() && matches!(c, '+' | ' ' | '(' | ')' | '-'))
+        };
         if let Some(chat) = self.chat(id)
             && !chat.name.is_empty()
-            && !chat.name.chars().all(|c| c.is_ascii_digit())
+            && !chat.name.chars().all(number)
         {
             return chat.name.clone();
         }
-        match crate::model::phone_of(id) {
+        match phone {
             Some(digits) => crate::util::phone(digits),
             None => "Unknown".to_owned(),
         }
@@ -2100,13 +2186,17 @@ impl App {
     }
 
     /// Group members matching the active composer mention query.
+    ///
+    /// Everyone is offered first when this group allows it and the query is a
+    /// prefix of `@all` or of the language's own word.
     pub fn mention_candidates(&self, chat: &Chat, query: &str) -> Vec<(String, String)> {
         if !chat.is_group() {
             return Vec::new();
         }
         let needle = query.trim().to_lowercase();
         let digits: String = query.chars().filter(char::is_ascii_digit).collect();
-        self.participant_list(chat)
+        let mut found: Vec<(String, String)> = self
+            .participant_list(chat)
             .into_iter()
             .filter(|(id, name)| {
                 if self.me.as_deref() == Some(id) {
@@ -2124,7 +2214,18 @@ impl App {
                             .next()
                             .is_some_and(|user| user.contains(&digits)))
             })
-            .collect()
+            .collect();
+        let alias = crate::mentions::everyone_alias(self.locale);
+        if chat.can_mention_everyone() && crate::mentions::everyone_query_matches(query, &alias) {
+            found.insert(
+                0,
+                (
+                    crate::mentions::ALL_ID.to_owned(),
+                    crate::mentions::ALL_USER.to_owned(),
+                ),
+            );
+        }
+        found
     }
 
     pub fn participant_names(&self, chat: &Chat) -> String {
@@ -2622,6 +2723,13 @@ impl App {
                     && let Some(existing) = conversation.message_mut(&message.id)
                 {
                     let state = existing.content.media().map(|media| media.state.clone());
+                    let motion_state = match &existing.content {
+                        Content::Image {
+                            motion: Some(motion),
+                            ..
+                        } => Some(motion.state.clone()),
+                        _ => None,
+                    };
                     let carousel_states = match &existing.content {
                         Content::Interactive {
                             card: Some(card), ..
@@ -2642,6 +2750,16 @@ impl App {
                     }
                     if let (Some(state), Some(media)) = (state, existing.content.media_mut()) {
                         media.state = state;
+                    }
+                    if let (
+                        Some(state),
+                        Content::Image {
+                            motion: Some(motion),
+                            ..
+                        },
+                    ) = (motion_state, &mut existing.content)
+                    {
+                        motion.state = state;
                     }
                 }
             }
@@ -2746,6 +2864,45 @@ impl App {
                 message,
                 result,
             } => self.handle_media(&chat, &message, card, result),
+            Event::Motion {
+                chat,
+                message,
+                result,
+            } => {
+                // The preview asked for the clip to play it.
+                let previewed = !self.events_hidden
+                    && self.open_chat.as_deref() == Some(chat.as_str())
+                    && self.image_preview.as_ref().is_some_and(|preview| {
+                        self.conversations
+                            .get(&chat)
+                            .and_then(|conversation| conversation.message(&message))
+                            .and_then(|message| message.content.media())
+                            .and_then(|media| media.path.as_deref())
+                            == Some(preview.path())
+                    });
+                if let Some(motion) = self.motion_mut(&chat, &message) {
+                    match result {
+                        Ok(path) => {
+                            motion.path = Some(path.clone());
+                            motion.state = MediaState::Idle;
+                            if previewed {
+                                self.actions.push(Action::CloseImagePreview);
+                                self.actions.push(Action::ExpandVideo { message, path });
+                            }
+                        }
+                        Err(error) => {
+                            motion.state = MediaState::Failed(error);
+                            if self
+                                .motion_playing
+                                .as_ref()
+                                .is_some_and(|(c, m)| *c == chat && *m == message)
+                            {
+                                self.motion_playing = None;
+                            }
+                        }
+                    }
+                }
+            }
             Event::Syncing(syncing) => {
                 if self.syncing && !syncing {
                     self.toast("History loaded");
@@ -3063,6 +3220,11 @@ impl App {
                 self.account_privacy = crate::privacy::Snapshot::default();
                 self.account_receipts_off = false;
                 self.open_chat = None;
+                // Every recorded place named a chat of the account that just
+                // went away, but only when that account is the one on screen.
+                if !self.events_hidden {
+                    self.nav_history.clear();
+                }
                 // Unsent text belongs to the account that was unlinked.
                 self.drafts.clear();
                 self.draft_mentions.clear();
@@ -3315,6 +3477,7 @@ impl App {
         if self.open_chat.as_deref() == Some(id)
             && self.editing.is_none()
             && !self.composer.is_empty()
+            && !self.is_untouched_prefill(id, &self.composer)
         {
             let draft = std::mem::take(&mut self.composer);
             let mentions = std::mem::take(&mut self.composer_mentions);
@@ -3325,6 +3488,7 @@ impl App {
                 self.drafts.get(id).map(String::as_str).unwrap_or_default(),
             );
         }
+        self.prefilled = None;
         self.leave_chat(id);
     }
 
@@ -3420,6 +3584,13 @@ impl App {
             chat: chat.to_owned(),
             text: text.to_owned(),
         });
+    }
+
+    fn motion_mut(&mut self, chat: &str, id: &str) -> Option<&mut crate::model::Motion> {
+        match &mut self.conversations.get_mut(chat)?.message_mut(id)?.content {
+            Content::Image { motion, .. } => motion.as_mut(),
+            _ => None,
+        }
     }
 
     fn handle_media(
@@ -3616,6 +3787,75 @@ impl App {
         self.backend.send(Command::MarkUnread(chat.to_owned()));
     }
 
+    /// Records where the window now is, for the back and forward buttons. The
+    /// place is built only when it changed, so an idle frame allocates
+    /// nothing.
+    fn record_location(&mut self) {
+        if self
+            .nav_history
+            .is_current(&self.page, self.open_chat.as_deref())
+        {
+            return;
+        }
+        self.nav_history.visit(Location {
+            page: self.page.clone(),
+            chat: self.open_chat.clone(),
+        });
+    }
+
+    /// Steps to the place visited before this one, as the mouse's back button
+    /// does.
+    fn navigate_back(&mut self, ctx: &egui::Context) {
+        // A place the window cannot show is forgotten by `show_location`, and
+        // the step moves on to the one before it, so one press never lands on
+        // a place that shows nothing. Each call takes a place off the stack,
+        // so this ends at the oldest.
+        while let Some(location) = self.nav_history.back() {
+            if self.show_location(location, ctx) {
+                break;
+            }
+        }
+    }
+
+    /// Steps forward again after a back step, as the mouse's forward button
+    /// does.
+    fn navigate_forward(&mut self, ctx: &egui::Context) {
+        while let Some(location) = self.nav_history.forward() {
+            if self.show_location(location, ctx) {
+                break;
+            }
+        }
+    }
+
+    /// Restores a place through the same actions the interface uses, so a
+    /// draft is saved and a locked chat stays shut. Reports whether the window
+    /// could show it; a place naming a chat it cannot open is forgotten.
+    fn show_location(&mut self, location: Location, ctx: &egui::Context) -> bool {
+        let wanted = location.chat.clone();
+        // The chat first: opening one lands on the chat list, and the page
+        // below puts the reader back on the page the place recorded.
+        if self.open_chat != location.chat {
+            // A place whose chat is gone closes the current chat instead.
+            match location.chat {
+                Some(chat) if self.chat(&chat).is_some() => self.apply(Action::OpenChat(chat), ctx),
+                _ => self.apply(Action::CloseChat, ctx),
+            }
+        }
+        if self.page != location.page {
+            self.apply(Action::Open(location.page), ctx);
+        }
+        // A chat that is gone, or locked outside its folder, cannot be opened.
+        // Keeping its place would make every back step land on it again and
+        // replace the forward history.
+        if let Some(chat) = wanted
+            && self.open_chat.as_deref() != Some(chat.as_str())
+        {
+            self.nav_history.forget(&chat);
+            return false;
+        }
+        true
+    }
+
     fn open_chat(&mut self, id: ChatId) {
         // Notifications and stale actions must not open a locked chat from
         // outside the authenticated folder.
@@ -3635,12 +3875,17 @@ impl App {
             self.jump_highlight = None;
             if let Some(previous) = self.open_chat.take() {
                 let draft = std::mem::take(&mut self.composer);
+                // Text a link brought, and the reader never changed, is not
+                // their draft: the one they wrote stays theirs. An edit of it
+                // is theirs, and is kept as any other text is.
+                let untouched_prefill = self.is_untouched_prefill(&previous, &draft);
+                self.prefilled = None;
                 // Discard an unfinished edit instead of keeping it as a draft.
                 if self.editing.take().is_some() || draft.trim().is_empty() {
                     self.drafts.remove(&previous);
                     self.draft_mentions.remove(&previous);
                     self.composer_mentions.clear();
-                } else {
+                } else if !untouched_prefill {
                     self.drafts.insert(previous.clone(), draft);
                     let mentions = std::mem::take(&mut self.composer_mentions);
                     self.draft_mentions.insert(previous.clone(), mentions);
@@ -3659,6 +3904,7 @@ impl App {
                         placed: false,
                     });
             self.composer = self.drafts.remove(&id).unwrap_or_default();
+            self.prefilled = None;
             self.composer_mentions = self.draft_mentions.remove(&id).unwrap_or_default();
             // A search belongs to the chat it was typed in.
             self.close_chat_search();
@@ -3783,6 +4029,8 @@ impl App {
             return;
         }
         let (text, mentions) = self.encode_composer_mentions(&chat, text);
+        let mention_everyone = self.chat(&chat).is_some_and(Chat::can_mention_everyone)
+            && crate::mentions::has_everyone_token(&text);
         self.emoji_start = None;
         self.mention_start = None;
         self.stop_composing(&chat);
@@ -3795,6 +4043,9 @@ impl App {
                 message.content = Content::text(text.clone());
                 message.edited = true;
                 message.mentions = mention_refs(&mentions);
+                if mention_everyone {
+                    crate::mentions::push_everyone(&mut message.mentions);
+                }
             }
             self.backend.send(Command::EditText {
                 chat,
@@ -3848,6 +4099,13 @@ impl App {
             if contains_mention_token(&text, user) && !mentions.iter().any(|known| known == &id) {
                 mentions.push(id);
             }
+        }
+        // A localized word is only a way to type the mention. The body that
+        // goes out, and the bubble, keep the visible `@all` token. When this
+        // chat cannot mention everyone, the typed word stays ordinary text.
+        if self.chat(chat).is_some_and(Chat::can_mention_everyone) {
+            let alias = crate::mentions::everyone_alias(self.locale);
+            crate::mentions::rewrite_alias(&mut text, &alias);
         }
         (text, mentions)
     }
@@ -4026,10 +4284,29 @@ impl App {
     }
 
     /// Remembers the window's size, position and maximized state in the
-    /// settings; see [`crate::window::Snapshot`].
+    /// settings, in logical pixels, so a window saved while zoomed opens at
+    /// the same size; see [`fastframe_shell::window::Geometry`].
     fn sync_window_state(&mut self, ctx: &egui::Context) {
-        if crate::window::Snapshot::read(ctx).remember(&mut self.settings) {
+        let mut geometry = self.settings.window_geometry();
+        if geometry.remember(ctx) {
+            self.settings.set_window_geometry(geometry);
             self.mark_settings_dirty();
+        }
+    }
+
+    /// What must happen in every pass of an open window, including the
+    /// passes eframe runs without `ui` for a minimized or covered one. Call it
+    /// from `eframe::App::logic`, after [`Self::background_frame`].
+    pub fn window_logic(&mut self, ctx: &egui::Context) {
+        self.sync_window_state(ctx);
+        // Close the window and continue headless when background mode is
+        // enabled. Decided here rather than in `frame_ui`, which eframe skips
+        // for a minimized window: closing one from the taskbar quit instead.
+        if ctx.input(|input| input.viewport().close_requested())
+            && !self.quit_requested
+            && self.hides_to_tray()
+        {
+            self.hide_intent = true;
         }
     }
 
@@ -4150,9 +4427,13 @@ impl App {
         while !actions.is_empty() {
             for action in actions.drain(..) {
                 self.apply(action, ctx);
+                self.record_location();
             }
             actions = std::mem::take(&mut self.actions);
         }
+        // A frame with no queued action still fixes the opening place, so the
+        // first navigation has somewhere to return to.
+        self.record_location();
     }
 
     fn apply(&mut self, action: Action, ctx: &egui::Context) {
@@ -4172,14 +4453,36 @@ impl App {
             return;
         }
         if self.app_lock.is_locked() && !allowed_while_locked(&action) {
-            // A clicked notification opens its message once unlocked; the
-            // rest would show or change what the lock hides.
-            if let Action::OpenMessage { chat, message } = action {
-                self.app_lock.deferred = Some(crate::notify::NotificationTarget {
-                    account: self.account().id.clone(),
-                    chat,
-                    message,
-                });
+            // A clicked notification opens its message once unlocked, and a
+            // link opens the chat it named; the rest would show or change
+            // what the lock hides.
+            match action {
+                Action::OpenMessage { chat, message } => {
+                    self.app_lock.deferred = Some(crate::notify::NotificationTarget {
+                        account: self.account().id.clone(),
+                        chat,
+                        message,
+                    });
+                }
+                Action::StartChat { id, name: _ } => {
+                    // The name is the number, which the chat carries, so
+                    // nothing extra has to be kept for the replay.
+                    self.app_lock.deferred_request = Some(crate::target::Request {
+                        chat: id,
+                        text: None,
+                    });
+                }
+                Action::PrefillComposer { chat, text } => {
+                    // The chat it belongs to arrives in the request the
+                    // StartChat above is holding; a template without its
+                    // chat has nowhere to go.
+                    if let Some(request) = self.app_lock.deferred_request.as_mut()
+                        && request.chat == chat
+                    {
+                        request.text = Some(text);
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -4238,6 +4541,8 @@ impl App {
                 self.apply(Action::Open(page), ctx);
             }
             Action::OpenChat(id) => self.open_chat(id),
+            Action::NavigateBack => self.navigate_back(ctx),
+            Action::NavigateForward => self.navigate_forward(ctx),
             Action::StartChat { id, name } => {
                 if self.chat(&id).is_none() {
                     self.chats.push(Chat::new(id.clone(), name.clone()));
@@ -4248,6 +4553,29 @@ impl App {
                 }
                 self.open_chat(id);
                 self.dialog = None;
+            }
+            Action::PrefillComposer { chat, text } => {
+                // The composer belongs to whoever is reading: a template is
+                // only a start, and only where nothing is already written.
+                if self.open_chat.as_deref() != Some(chat.as_str()) {
+                    // The chat was not opened. `open_chat` refuses a locked
+                    // chat outside its folder, and the reader is still in
+                    // another one: its text must not go there.
+                    return;
+                }
+                if self.editing.is_none()
+                    && self.composer.trim().is_empty()
+                    && self.recording.is_none()
+                    && self.reply_to.is_none()
+                    && !self.drafts.contains_key(&chat)
+                {
+                    self.composer = text.clone();
+                    self.prefilled = Some((chat, text));
+                    self.composer_mentions.clear();
+                    self.emoji_start = None;
+                    self.mention_start = None;
+                    self.focus_composer = true;
+                }
             }
             Action::MessageYourself => {
                 if let Some(id) = self.me.clone() {
@@ -4307,7 +4635,10 @@ impl App {
                 if let Some(chat) = self.open_chat.take() {
                     self.stop_composing(&chat);
                     let draft = std::mem::take(&mut self.composer);
-                    if self.editing.take().is_none() && !draft.trim().is_empty() {
+                    if self.is_untouched_prefill(&chat, &draft) {
+                        // A link's text is not the reader's; theirs stays.
+                        self.composer_mentions.clear();
+                    } else if self.editing.take().is_none() && !draft.trim().is_empty() {
                         self.drafts.insert(chat.clone(), draft);
                         let mentions = std::mem::take(&mut self.composer_mentions);
                         self.draft_mentions.insert(chat, mentions);
@@ -4412,6 +4743,31 @@ impl App {
                 conversation.phone_explicit = true;
                 self.backend.send(Command::ReloadHistory { chat, message });
                 self.toast("Requesting earlier messages from your phone");
+            }
+            Action::ToggleMotion { chat, message } => {
+                let playing = (chat, message);
+                if self.motion_playing.as_ref() == Some(&playing) {
+                    self.motion_playing = None;
+                    return;
+                }
+                let (chat, message) = playing.clone();
+                self.motion_playing = Some(playing);
+                if self
+                    .motion_mut(&chat, &message)
+                    .is_some_and(|motion| motion.path.is_none())
+                {
+                    self.actions.push(Action::DownloadMotion { chat, message });
+                }
+            }
+            Action::DownloadMotion { chat, message } => {
+                let Some(motion) = self.motion_mut(&chat, &message) else {
+                    return;
+                };
+                if matches!(motion.state, MediaState::Downloading) {
+                    return;
+                }
+                motion.state = MediaState::Downloading;
+                self.backend.send(Command::DownloadMotion { chat, message });
             }
             Action::Download {
                 card,
@@ -4954,22 +5310,31 @@ impl App {
                 start,
                 end,
             } => {
-                let member = self.current_chat().is_some_and(|chat| {
+                let chat = self.current_chat();
+                let everyone =
+                    id == crate::mentions::ALL_ID && chat.is_some_and(Chat::can_mention_everyone);
+                let member = chat.is_some_and(|chat| {
                     chat.is_group() && chat.participants.iter().any(|known| known == &id)
                 });
                 let mention_at = start
                     .checked_add(1)
                     .is_some_and(|after| self.composer.get(start..after) == Some("@"));
-                if member
+                if (member || everyone)
                     && start <= end
                     && self.composer.is_char_boundary(start)
                     && self.composer.is_char_boundary(end)
                     && mention_at
                 {
-                    let mention = format!("@{name}");
+                    let mention = if everyone {
+                        format!("@{}", crate::mentions::ALL_USER)
+                    } else {
+                        format!("@{name}")
+                    };
                     let inserted = format!("{mention} ");
                     self.composer.replace_range(start..end, &inserted);
-                    self.composer_mentions.push(ComposerMention { id, name });
+                    if !everyone {
+                        self.composer_mentions.push(ComposerMention { id, name });
+                    }
                     let cursor = self.composer[..start + inserted.len()].chars().count();
                     self.set_composer_cursor(ctx, cursor);
                     self.focus_composer = true;
@@ -5808,6 +6173,9 @@ impl App {
                 if self.window_hidden {
                     // The headless loop in `main` will create the window.
                     self.wants_show = true;
+                } else if self.wayland && self.raise_on_compositor() {
+                    // The compositor (niri) focused the existing window and
+                    // switched to its workspace, so nothing is reopened.
                 } else if self.wayland {
                     // Wayland drops a programmatic focus or unminimize
                     // request, so a minimized or covered window cannot come
@@ -5938,6 +6306,7 @@ impl App {
             self.window_focused = false;
         }
         self.report_presence();
+        self.handle_power();
         self.handle_tray();
         #[cfg(target_os = "macos")]
         self.actions.extend(crate::macos::drain(self.window_hidden));
@@ -5948,7 +6317,7 @@ impl App {
         self.handle_notification_opens();
         self.handle_events();
         self.tick(ctx);
-        self.tick_audio();
+        self.tick_audio(ctx);
         self.tick_video(ctx);
         self.apply_actions(ctx);
         self.sync_ringtone();
@@ -5958,6 +6327,28 @@ impl App {
         self.request_attention(ctx);
     }
 
+    /// Answers the system's sleep and wake. Every account reconnects its link
+    /// after a wake (Linux and Windows report it; macOS does not yet, so
+    /// there the worker's link watch notices the sleep on its own). Settings
+    /// waiting for their debounced save are saved before the machine sleeps
+    /// or the session ends.
+    fn handle_power(&mut self) {
+        for event in self.power.events() {
+            match event {
+                fastframe_power::Event::Suspending(ack)
+                | fastframe_power::Event::EndingSession(ack) => {
+                    self.save_state();
+                    ack.done();
+                }
+                fastframe_power::Event::Resumed => {
+                    for account in &self.accounts {
+                        account.backend.send(Command::Resumed);
+                    }
+                }
+            }
+        }
+    }
+
     /// Highlights the taskbar entry for a message that notified while the
     /// window is open behind others, as KDE Plasma's task manager shows for
     /// chat apps. The desktop clears it once the window is focused. Linux
@@ -5965,8 +6356,15 @@ impl App {
     /// viewport too, since `window_focused` stays false behind the app lock
     /// even while the lock screen has the focus.
     fn request_attention(&mut self, ctx: &egui::Context) {
+        self.request_attention_on(ctx, fastframe_desktop::is_gnome());
+    }
+
+    /// [`Self::request_attention`] on a desktop that is GNOME or not, which
+    /// shows its own "is ready" notice instead of marking the taskbar (#466).
+    fn request_attention_on(&mut self, ctx: &egui::Context, gnome: bool) {
         if std::mem::take(&mut self.wants_attention)
             && cfg!(target_os = "linux")
+            && !gnome
             && !self.window_hidden
             && !self.window_focused
             && ctx.input(|input| input.viewport().focused) != Some(true)
@@ -6052,12 +6450,27 @@ impl App {
                     return;
                 }
                 self.app_lock.unlocked(matched);
-                if matched && let Some(target) = self.app_lock.deferred.take() {
-                    self.switch_account(&target.account);
-                    self.actions.push(Action::OpenMessage {
-                        chat: target.chat,
-                        message: target.message,
-                    });
+                if matched {
+                    if let Some(target) = self.app_lock.deferred.take() {
+                        self.switch_account(&target.account);
+                        self.actions.push(Action::OpenMessage {
+                            chat: target.chat,
+                            message: target.message,
+                        });
+                    }
+                    if let Some(request) = self.app_lock.deferred_request.take() {
+                        self.actions.push(Action::ShowWindow);
+                        self.actions.push(Action::StartChat {
+                            name: request.display_name(),
+                            id: request.chat.clone(),
+                        });
+                        if let Some(text) = request.text {
+                            self.actions.push(Action::PrefillComposer {
+                                chat: request.chat,
+                                text,
+                            });
+                        }
+                    }
                 }
             }
             Outcome::WrongCurrent => {
@@ -6091,6 +6504,7 @@ impl App {
     fn forget_app_lock(&mut self) {
         self.app_lock.form = None;
         self.app_lock.deferred = None;
+        self.app_lock.deferred_request = None;
         self.app_lock.release();
         if self.settings.app_lock_hash.take().is_some() {
             self.save_settings();
@@ -6158,7 +6572,7 @@ impl App {
     }
 
     /// Polls audio state and schedules repaints while it changes.
-    fn tick_audio(&mut self) {
+    fn tick_audio(&mut self, ctx: &egui::Context) {
         if let Err(error) = self.player.poll() {
             self.toast_error(error);
         }
@@ -6169,8 +6583,18 @@ impl App {
             self.recording = None;
             self.toast_error(format!("Could not record: {error}"));
         }
+        // The playback bar, the recording light and the waveform only show
+        // progress, so they step while a screen reader is attached.
+        let stepped = crate::motion::screen_reader_attached(ctx);
+        if let Some(recorder) = &self.recording {
+            recorder.set_stepped(stepped);
+        }
         if self.player.is_playing() || self.recording.is_some() {
-            self.waker.wake_after(Duration::from_millis(40));
+            self.waker.wake_after(if stepped {
+                crate::motion::STEP
+            } else {
+                Duration::from_millis(40)
+            });
         }
         // Let the media hold lapse on time if the next clip never lands.
         if let Some((_, _, since)) = &self.voice_wanted {
@@ -6381,7 +6805,6 @@ impl App {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = None;
         self.apply_theme(ctx);
-        self.sync_window_state(ctx);
         if ctx.input(|input| input.events.iter().any(is_user_input)) {
             self.app_lock.note_input();
         }
@@ -6403,13 +6826,6 @@ impl App {
         }
         self.window_focused = focused;
         self.report_presence();
-        // Close the window and continue headless when background mode is enabled.
-        if ctx.input(|input| input.viewport().close_requested())
-            && !self.quit_requested
-            && self.hides_to_tray()
-        {
-            self.hide_intent = true;
-        }
         if locked {
             // Files dropped or pasted on the lock screen go nowhere.
             self.dropping = false;
@@ -6610,6 +7026,7 @@ impl App {
     fn flush_open_draft(&self) {
         if let Some(chat) = self.open_chat.as_deref()
             && self.editing.is_none()
+            && !self.is_untouched_prefill(chat, &self.composer)
         {
             self.store_draft(chat, &self.composer);
         }
@@ -6884,11 +7301,358 @@ fn notification_eligible(chat: &Chat, now: i64, message_at: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChatKind, Content, Media, MediaState, ToastKind};
+    use crate::model::{ChatKind, Content, Dialog, Media, MediaState, ToastKind};
 
     fn app() -> App {
         let root = std::env::temp_dir().join(format!("zapfast-app-{}", std::process::id()));
         App::headless(AppDirs::under(&root), Settings::default()).0
+    }
+
+    /// While recording, the light, the timer and the waveform ask for a
+    /// frame every 40 ms, or every step while a screen reader is attached,
+    /// and the recorder then stops asking for frames of its own.
+    #[test]
+    fn recording_progress_steps_while_a_screen_reader_is_attached() {
+        let run = |reader: bool| {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = App::headless(AppDirs::under(directory.path()), Settings::default()).0;
+            let ctx = crate::motion::tests::reading(reader);
+            app.waker.attach(&ctx);
+            app.recording = Some(Recorder::rehearsal());
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.tick_audio(ui.ctx()));
+            output.textures_delta.clear();
+            let stepped = app.recording.as_ref().is_some_and(Recorder::is_stepped);
+            (
+                output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                stepped,
+            )
+        };
+        let predicted = Duration::from_secs_f32(1.0 / 60.0);
+        assert_eq!(run(false), (Duration::from_millis(40) - predicted, false));
+        assert_eq!(run(true), (crate::motion::STEP - predicted, true));
+    }
+
+    #[test]
+    fn back_and_forward_walk_between_chats_and_settings() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "15550008888@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Ada".into()));
+        // The first frame fixes the place the window opened on.
+        app.apply_actions(&ctx);
+
+        let open = |app: &mut App, action: Action| {
+            app.actions.push(action);
+            app.apply_actions(&ctx);
+        };
+        open(&mut app, Action::OpenChat(chat.into()));
+        assert_eq!(app.open_chat.as_deref(), Some(chat));
+        open(&mut app, Action::Open(Page::Settings));
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.open_chat.as_deref(), Some(chat));
+
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(app.page, Page::Chats, "back leaves Settings");
+        assert_eq!(app.open_chat.as_deref(), Some(chat));
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(app.open_chat, None, "back leaves the chat");
+
+        app.apply(Action::NavigateForward, &ctx);
+        assert_eq!(app.open_chat.as_deref(), Some(chat), "forward reopens it");
+        app.apply(Action::NavigateForward, &ctx);
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.open_chat.as_deref(), Some(chat));
+    }
+
+    #[test]
+    fn a_dialog_is_not_a_place_in_the_history() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "15550007777@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Ada".into()));
+        app.apply_actions(&ctx);
+
+        app.actions.push(Action::OpenChat(chat.into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::ShowDialog(Dialog::NewChat));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::CloseDialog);
+        app.apply_actions(&ctx);
+
+        // The dialog never became a place, so one back step reaches the list.
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(app.open_chat, None);
+        assert_eq!(app.page, Page::Chats);
+        assert_eq!(app.dialog, None, "the dialog is not restored");
+    }
+
+    #[test]
+    fn a_deleted_chat_is_not_reopened_from_the_history() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "15550007777@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Ada".into()));
+        app.apply_actions(&ctx);
+
+        app.actions.push(Action::OpenChat(chat.into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::Open(Page::Settings));
+        app.apply_actions(&ctx);
+
+        // The phone deletes the chat while the window is elsewhere.
+        app.forget_chat(chat);
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat, None);
+
+        // The step skips the removed chat instead of reopening it.
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(app.page, Page::Chats);
+        assert_eq!(app.open_chat, None);
+    }
+
+    #[test]
+    fn a_gone_chat_is_never_reopened_from_a_stale_place() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "15550007777@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Ada".into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::OpenChat(chat.into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::Open(Page::Settings));
+        app.apply_actions(&ctx);
+
+        // Defence in depth: even when a path clears chats without pruning the
+        // history, a place naming a gone chat is not opened.
+        app.chats.clear();
+        app.open_chat = None;
+        app.apply(Action::NavigateBack, &ctx);
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(app.open_chat, None);
+        assert_eq!(app.page, Page::Chats);
+    }
+
+    /// Two accounts sharing `chat`: the first on screen, with `chat` opened
+    /// and Settings over it, and the second's event channel.
+    fn two_accounts_on_settings(
+        directory: &std::path::Path,
+        chat: &str,
+    ) -> (App, std::sync::mpsc::Sender<crate::backend::Event>) {
+        let ctx = egui::Context::default();
+        let dirs = AppDirs::under(directory);
+        let mut app = App::headless(dirs.clone(), Settings::default()).0;
+        let (second, events) = Account::detached(
+            &dirs,
+            AccountId::parse("2").unwrap(),
+            crate::settings::AccountSettings::default(),
+        )
+        .unwrap();
+        app.accounts.push(second);
+        app.active = 0;
+        app.chats.push(Chat::new(chat.into(), "Ada".into()));
+        app.accounts[1]
+            .chats
+            .push(Chat::new(chat.into(), "Ada".into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::OpenChat(chat.into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::Open(Page::Settings));
+        app.apply_actions(&ctx);
+        (app, events)
+    }
+
+    #[test]
+    fn a_hidden_accounts_chat_removal_leaves_the_history_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let chat = "15550007777@s.whatsapp.net";
+        let (mut app, events) = two_accounts_on_settings(directory.path(), chat);
+        let ctx = egui::Context::default();
+
+        events
+            .send(crate::backend::Event::ChatRemoved { chat: chat.into() })
+            .unwrap();
+        app.handle_events();
+
+        // The chat is gone from the hidden account only, and chat ids repeat
+        // across accounts, so the window's own place still names it.
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(app.page, Page::Chats);
+        assert_eq!(app.open_chat.as_deref(), Some(chat));
+    }
+
+    #[test]
+    fn a_hidden_accounts_logout_leaves_the_history_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let chat = "15550007777@s.whatsapp.net";
+        let (mut app, events) = two_accounts_on_settings(directory.path(), chat);
+        let ctx = egui::Context::default();
+
+        events
+            .send(crate::backend::Event::Link(LinkStatus::LoggedOut))
+            .unwrap();
+        app.handle_events();
+
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(
+            app.page,
+            Page::Chats,
+            "back still leaves the window's own Settings"
+        );
+        assert_eq!(app.open_chat.as_deref(), Some(chat));
+    }
+
+    #[test]
+    fn a_gone_chat_keeps_the_forward_history() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let gone = "15550007771@s.whatsapp.net";
+        let kept = "15550007772@s.whatsapp.net";
+        app.chats.push(Chat::new(gone.into(), "Ada".into()));
+        app.chats.push(Chat::new(kept.into(), "Grace".into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::OpenChat(gone.into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::OpenChat(kept.into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::Open(Page::Settings));
+        app.apply_actions(&ctx);
+
+        // A path that drops a chat without pruning the history, which the
+        // guard in `show_location` exists for.
+        app.chats.retain(|chat| chat.id != gone);
+
+        app.actions.push(Action::NavigateBack);
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat.as_deref(), Some(kept));
+        app.actions.push(Action::NavigateBack);
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat, None, "the gone chat is not reopened");
+
+        // The step that skipped the gone chat must not drop where a forward
+        // step would go.
+        app.actions.push(Action::NavigateForward);
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat.as_deref(), Some(kept));
+    }
+
+    #[test]
+    fn a_locked_chat_outside_its_folder_does_not_strand_the_history() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.settings.set_chat_lock_code(Some("123456"));
+        let locked = "15550007774@s.whatsapp.net";
+        let mut chat = Chat::new(locked.into(), "Ada".into());
+        chat.locked = true;
+        app.chats.push(chat);
+        app.apply_actions(&ctx);
+
+        // The reader opens the locked chat from the locked folder, then opens
+        // Settings over it.
+        app.apply(Action::UnlockLockedFolder("123456".into()), &ctx);
+        assert!(app.locked_folder_open());
+        app.actions.push(Action::OpenChat(locked.into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::Open(Page::Settings));
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat.as_deref(), Some(locked));
+
+        // Hiding the window closes the folder and drops the code, so the chat
+        // can no longer be opened from the history.
+        app.window_gone();
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat, None, "the locked chat is hidden again");
+
+        // Back must step past the place it cannot show in one press, and the
+        // way forward must survive the step.
+        app.actions.push(Action::NavigateBack);
+        app.apply_actions(&ctx);
+        assert_eq!(app.page, Page::Chats, "one press past the locked place");
+        assert_eq!(app.open_chat, None);
+
+        app.actions.push(Action::NavigateForward);
+        app.apply_actions(&ctx);
+        assert_eq!(app.page, Page::Settings, "forward still reaches Settings");
+    }
+
+    #[test]
+    fn a_new_place_drops_the_forward_history() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let first = "15550009991@s.whatsapp.net";
+        let second = "15550009992@s.whatsapp.net";
+        app.chats.push(Chat::new(first.into(), "Ada".into()));
+        app.chats.push(Chat::new(second.into(), "Grace".into()));
+        app.apply_actions(&ctx);
+
+        app.actions.push(Action::OpenChat(first.into()));
+        app.apply_actions(&ctx);
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(app.open_chat, None);
+
+        app.actions.push(Action::OpenChat(second.into()));
+        app.apply_actions(&ctx);
+        app.apply(Action::NavigateForward, &ctx);
+        assert_eq!(
+            app.open_chat.as_deref(),
+            Some(second),
+            "forward no longer reaches the chat the back step left"
+        );
+    }
+
+    #[test]
+    fn switching_accounts_forgets_the_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _commands) = two_accounts(directory.path());
+        let ctx = egui::Context::default();
+        let chat = "15550003333@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Ada".into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::OpenChat(chat.into()));
+        app.apply_actions(&ctx);
+        app.apply(Action::SwitchAccount(AccountId::parse("2").unwrap()), &ctx);
+        assert_eq!(app.open_chat, None, "the other account has no chat open");
+        app.apply(Action::NavigateBack, &ctx);
+        assert_eq!(
+            app.open_chat, None,
+            "the first account's chat is not restored"
+        );
+    }
+
+    #[test]
+    fn a_back_side_button_press_steps_back_through_a_frame() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.attach(&ctx);
+        let chat = "15550007777@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Ada".into()));
+        app.apply_actions(&ctx);
+        app.actions.push(Action::OpenChat(chat.into()));
+        app.apply_actions(&ctx);
+        assert_eq!(app.open_chat.as_deref(), Some(chat));
+
+        let press = |app: &mut App, button: egui::PointerButton| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::PointerButton {
+                        pos: egui::pos2(20.0, 20.0),
+                        button,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                },
+                |ui| app.frame_ui(ui),
+            );
+            output.textures_delta.clear();
+        };
+        press(&mut app, egui::PointerButton::Extra1);
+        assert_eq!(app.open_chat, None, "the back button closed the chat");
+        press(&mut app, egui::PointerButton::Extra2);
+        assert_eq!(
+            app.open_chat.as_deref(),
+            Some(chat),
+            "the forward button reopened it"
+        );
     }
 
     #[test]
@@ -7211,6 +7975,255 @@ mod tests {
         assert_eq!(app.scroll_route.owner, None, "the next gesture picks");
     }
 
+    /// The chat a link asked for can refuse to open: a locked chat outside
+    /// its folder stays shut, leaving the reader where they were. Its
+    /// template must not follow them there.
+    #[test]
+    fn a_template_does_not_land_in_another_chat() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let here = "here@s.whatsapp.net";
+        let locked = "locked@s.whatsapp.net";
+        app.chats.push(Chat::new(here.into(), "Here".into()));
+        let mut shut = Chat::new(locked.into(), "Shut".into());
+        shut.locked = true;
+        app.chats.push(shut);
+        app.open_chat = Some(here.into());
+
+        app.apply(
+            Action::PrefillComposer {
+                chat: locked.into(),
+                text: "This is not here".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.open_chat.as_deref(), Some(here));
+        assert!(
+            app.composer.is_empty(),
+            "the template stayed out of the open chat: {:?}",
+            app.composer
+        );
+    }
+
+    /// A link's template is a start, not something the reader left behind:
+    /// leaving the chat it filled must not store it as their draft.
+    #[test]
+    fn a_template_is_not_stored_as_a_draft() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.chats.push(Chat::new(other.into(), "Other".into()));
+
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123 is attached".into(),
+            },
+            &ctx,
+        );
+        assert_eq!(app.composer, "Invoice 123 is attached");
+
+        app.apply(Action::OpenChat(other.into()), &ctx);
+
+        assert_eq!(
+            app.drafts.get(chat),
+            None,
+            "the template became a draft: {:?}",
+            app.drafts.get(chat)
+        );
+    }
+
+    /// Every path that saves the composer has to know a template is not the
+    /// reader's text, not only the one that switches chats.
+    #[test]
+    fn a_template_is_not_saved_by_any_other_path_either() {
+        for save in [
+            // Closing the chat.
+            "close", // Switching account parks the composer.
+            "park",  // Locking or shutting down flushes it.
+            "flush", // Hiding a locked chat stores it.
+            "hide",
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = app();
+            let chat = "peer@s.whatsapp.net";
+            app.chats.push(Chat::new(chat.into(), "Peer".into()));
+            app.apply(
+                Action::StartChat {
+                    id: chat.into(),
+                    name: "Peer".into(),
+                },
+                &ctx,
+            );
+            app.apply(
+                Action::PrefillComposer {
+                    chat: chat.into(),
+                    text: "Invoice 123".into(),
+                },
+                &ctx,
+            );
+
+            match save {
+                "close" => app.apply(Action::CloseChat, &ctx),
+                "park" => app.park_composer(),
+                "flush" => app.flush_open_draft(),
+                "hide" => app.hide_locked_chat(chat),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(
+                app.drafts.get(chat),
+                None,
+                "the {save} path stored the template as a draft: {:?}",
+                app.drafts.get(chat)
+            );
+        }
+    }
+
+    /// The same paths must not delete a draft the reader did write, which is
+    /// the other half of the same rule.
+    #[test]
+    fn a_template_never_deletes_the_readers_draft() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        // The reader's draft arrives while the chat is open, as it does when
+        // the archive answers after the window is up.
+        app.drafts.insert(chat.into(), "Half written".into());
+        app.composer = "Half written".into();
+
+        app.apply(Action::CloseChat, &ctx);
+
+        assert_eq!(
+            app.drafts.get(chat).map(String::as_str),
+            Some("Half written"),
+            "the reader's own draft survived"
+        );
+    }
+
+    /// A reply the reader armed is theirs to send: a template must not take
+    /// the composer and drop the quote with it.
+    #[test]
+    fn a_template_leaves_an_armed_reply_alone() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.reply_to = Some("m1".into());
+
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.reply_to.as_deref(), Some("m1"), "the reply is kept");
+        assert!(app.composer.is_empty(), "and the composer is untouched");
+    }
+
+    /// An edit of a template is the reader's own text, and is kept the way
+    /// any other unsent text is.
+    #[test]
+    fn an_edited_template_is_kept_as_a_draft() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.chats.push(Chat::new(other.into(), "Other".into()));
+
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123".into(),
+            },
+            &ctx,
+        );
+        app.composer = "Invoice 123, paid".into();
+
+        app.apply(Action::OpenChat(other.into()), &ctx);
+
+        assert_eq!(
+            app.drafts.get(chat).map(String::as_str),
+            Some("Invoice 123, paid")
+        );
+    }
+
+    /// Unsent text the reader wrote wins over a template: a link does not
+    /// replace what they were already going to send.
+    #[test]
+    fn a_template_leaves_the_readers_own_draft_alone() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        let chat = "peer@s.whatsapp.net";
+        let other = "other@s.whatsapp.net";
+        app.chats.push(Chat::new(chat.into(), "Peer".into()));
+        app.chats.push(Chat::new(other.into(), "Other".into()));
+        app.drafts.insert(chat.into(), "Half written".into());
+
+        app.apply(
+            Action::StartChat {
+                id: chat.into(),
+                name: "Peer".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: chat.into(),
+                text: "Invoice 123".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.composer, "Half written", "the draft is what is shown");
+
+        // Opening the chat took the draft into the composer, as it does for
+        // any chat. Leaving stores it back, and it is still the reader's.
+        app.apply(Action::OpenChat(other.into()), &ctx);
+        assert_eq!(
+            app.drafts.get(chat).map(String::as_str),
+            Some("Half written"),
+            "the template did not become the stored draft"
+        );
+        app.apply(Action::OpenChat(chat.into()), &ctx);
+        assert_eq!(app.composer, "Half written", "and it comes back");
+    }
+
     /// A chat that is gone or emptied takes its confirmation with it: a modal
     /// left behind for a chat that no longer exists still dispatches its
     /// action, and after a remote clear that action would take what arrived
@@ -7257,15 +8270,53 @@ mod tests {
         assert!(app.taskbar_badge_count().is_none());
     }
 
-    /// Window geometry syncing lives in `window::tests`: this frame only
-    /// forwards the snapshot and marks the settings dirty.
+    /// Every account reconnects when the system reports a wake, and a sleep
+    /// is answered at once, with the settings saved.
     #[test]
-    fn sync_window_state_marks_the_settings_dirty_on_change() {
+    fn a_wake_reconnects_every_account_and_a_sleep_saves_first() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        app.power.send(fastframe_power::Event::Resumed);
+        app.handle_power();
+        assert!(matches!(commands.try_recv(), Ok(Command::Resumed)));
+        assert!(commands.try_recv().is_err(), "once per wake");
+
+        app.settings_dirty = true;
+        let ack = fastframe_power::Ack::default();
+        app.power.send(fastframe_power::Event::Suspending(ack));
+        app.handle_power();
+        assert!(!app.settings_dirty, "saved before sleeping");
+        assert!(commands.try_recv().is_err());
+    }
+
+    /// The window's geometry is remembered in the logic pass, which eframe
+    /// runs for a minimized window too, and only a change marks the settings
+    /// for saving.
+    #[test]
+    fn the_logic_pass_remembers_the_window_geometry() {
         let mut app = app();
         let ctx = egui::Context::default();
-        // A headless context carries no viewport, so nothing is remembered.
-        app.sync_window_state(&ctx);
-        assert!(!app.settings_dirty);
+        let run = |app: &mut App, rect: egui::Rect| {
+            let mut input = egui::RawInput::default();
+            let info = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            info.inner_rect = Some(rect);
+            info.outer_rect = Some(rect.expand(4.0));
+            info.maximized = Some(false);
+            let mut output = ctx.run_ui(input, |ui| app.window_logic(ui.ctx()));
+            output.textures_delta.clear();
+        };
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(1280.0, 800.0));
+        run(&mut app, rect);
+        assert!(app.settings_dirty);
+        assert_eq!(
+            (app.settings.window_width, app.settings.window_height),
+            (Some(1280.0), Some(800.0))
+        );
+
+        app.settings_dirty = false;
+        run(&mut app, rect);
+        assert!(!app.settings_dirty, "nothing changed, nothing to save");
     }
 
     /// A short chat asks the phone by itself; only the reader scrolling to
@@ -8014,10 +9065,45 @@ mod tests {
         assert!(!app.hides_to_tray(), "the setting still decides");
     }
 
+    /// eframe runs only the logic pass for a minimized window, so closing one
+    /// (from the taskbar, say) must still hide it to the tray rather than
+    /// quit, and quit when nothing could bring it back.
+    #[test]
+    fn closing_a_minimized_window_hides_it_to_the_tray() {
+        use fastframe_shell::{Closed, Resident};
+        let ctx = egui::Context::default();
+        let close_minimized = |app: &mut App| {
+            let mut input = egui::RawInput::default();
+            let info = input.viewports.entry(egui::ViewportId::ROOT).or_default();
+            info.minimized = Some(true);
+            info.events.push(egui::ViewportEvent::Close);
+            let mut output = ctx.run_ui(input, |ui| app.window_logic(ui.ctx()));
+            output.textures_delta.clear();
+        };
+
+        let mut app = app();
+        app.test_tray_shown = Some(true);
+        close_minimized(&mut app);
+        assert!(app.hide_intent);
+        assert_eq!(app.closed(), Closed::Hide);
+
+        let mut app = self::app();
+        app.test_tray_shown = Some(false);
+        close_minimized(&mut app);
+        assert_eq!(app.closed(), Closed::Quit, "no tray, no way back");
+
+        let mut app = self::app();
+        app.test_tray_shown = Some(true);
+        app.quit_requested = true;
+        close_minimized(&mut app);
+        assert_eq!(app.closed(), Closed::Quit);
+    }
+
     /// A Wayland compositor ignores an app's focus and unminimize requests, so
     /// a notification click or a second launch closes the window and asks the
-    /// shell for a fresh one, which the compositor raises. Elsewhere the
-    /// window is only told to restore and focus.
+    /// shell for a fresh one, which the compositor raises, unless the
+    /// compositor (niri) can raise the existing one. Elsewhere the window is
+    /// only told to restore and focus.
     #[test]
     fn a_wayland_show_reopens_the_window_instead_of_focusing_it() {
         use fastframe_shell::{Closed, Resident};
@@ -8028,6 +9114,14 @@ mod tests {
         app.apply(Action::ShowWindow, &ctx);
         assert!(app.reopen, "Wayland closes the window to make a fresh one");
         assert_eq!(app.closed(), Closed::Reopen);
+
+        // niri brings the existing window forward, on its own workspace.
+        let mut app = self::app();
+        app.wayland = true;
+        app.test_raised = true;
+        app.apply(Action::ShowWindow, &ctx);
+        assert!(!app.reopen, "a raised window is not reopened");
+        assert_ne!(app.closed(), Closed::Reopen);
 
         let mut app = self::app();
         app.wayland = false;
@@ -9086,6 +10180,13 @@ mod tests {
         assert!(app.addresses_us(&reply));
         reply.quoted = Some(quote("15550002222@s.whatsapp.net"));
         assert!(!app.addresses_us(&reply));
+
+        let mut everyone = plain.clone();
+        everyone.mentions = vec![crate::mentions::everyone_ref()];
+        assert!(
+            app.addresses_us(&everyone),
+            "mentioning everyone includes us"
+        );
     }
 
     #[test]
@@ -9811,6 +10912,7 @@ mod tests {
         let chat = "fixture@s.whatsapp.net";
         let image = |path: Option<PathBuf>, state: MediaState| Message {
             content: Content::Image {
+                motion: None,
                 caption: None,
                 media: Media {
                     mime: "image/jpeg".into(),
@@ -9990,6 +11092,7 @@ mod tests {
         let chat = "fixture@s.whatsapp.net";
         let mut attachment = message(chat, "picture", 1);
         attachment.content = Content::Image {
+            motion: None,
             caption: None,
             media: Media {
                 mime: "image/jpeg".into(),
@@ -10565,6 +11668,7 @@ mod tests {
         let chat = "peer@s.whatsapp.net";
         let mut attachment = message(chat, "picture", 1);
         attachment.content = Content::Image {
+            motion: None,
             caption: None,
             media: Media {
                 mime: "image/jpeg".into(),
@@ -11674,6 +12778,119 @@ mod tests {
         assert!(mentions.is_empty());
     }
 
+    fn group_chat(members: usize) -> Chat {
+        let mut chat = Chat::new("123@g.us".into(), "Group".into());
+        chat.participants = (0..members)
+            .map(|index| format!("{index}@s.whatsapp.net"))
+            .collect();
+        chat
+    }
+
+    #[test]
+    fn a_localized_everyone_word_becomes_the_visible_token() {
+        let mut app = app();
+        app.locale = Locale::PortugueseBrazil;
+        app.chats.push(group_chat(3));
+
+        let (text, mentions) =
+            app.encode_composer_mentions("123@g.us", "oi @todos, mail@todos.com @todosX".into());
+
+        assert_eq!(text, "oi @all, mail@todos.com @todosX");
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn english_leaves_a_portuguese_everyone_word_alone() {
+        let mut app = app();
+        app.chats.push(group_chat(3));
+
+        let (text, _) = app.encode_composer_mentions("123@g.us", "hi @todos and @all".into());
+
+        assert_eq!(text, "hi @todos and @all");
+    }
+
+    #[test]
+    fn everyone_is_not_rewritten_when_the_group_disallows_it() {
+        let mut app = app();
+        app.locale = Locale::PortugueseBrazil;
+        let chat = group_chat(33);
+        assert!(!chat.can_mention_everyone());
+        app.chats.push(chat);
+
+        let (text, _) = app.encode_composer_mentions("123@g.us", "oi @todos @all".into());
+
+        assert_eq!(text, "oi @todos @all");
+    }
+
+    #[test]
+    fn everyone_is_offered_only_when_the_group_allows_it() {
+        let mut app = app();
+        app.locale = Locale::PortugueseBrazil;
+        let small = group_chat(3);
+        let offered = app.mention_candidates(&small, "to");
+        assert_eq!(offered[0].0, crate::mentions::ALL_ID);
+        assert!(
+            app.mention_candidates(&small, "mira")
+                .iter()
+                .all(|(id, _)| id != crate::mentions::ALL_ID)
+        );
+
+        let mut large = group_chat(33);
+        assert!(
+            app.mention_candidates(&large, "")
+                .iter()
+                .all(|(id, _)| id != crate::mentions::ALL_ID)
+        );
+        large.admin = true;
+        assert_eq!(
+            app.mention_candidates(&large, "all")[0].0,
+            crate::mentions::ALL_ID
+        );
+
+        let direct = Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        assert!(app.mention_candidates(&direct, "").is_empty());
+    }
+
+    #[test]
+    fn choosing_everyone_inserts_the_visible_token() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.chats.push(group_chat(3));
+        app.open_chat("123@g.us".into());
+        app.composer = "@tod".into();
+
+        app.apply(
+            Action::InsertMention {
+                id: crate::mentions::ALL_ID.into(),
+                name: "all".into(),
+                start: 0,
+                end: app.composer.len(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.composer, "@all ");
+        assert!(app.composer_mentions.is_empty());
+
+        app.composer = "@all".into();
+        app.chats[0].participants = (0..33)
+            .map(|index| format!("{index}@s.whatsapp.net"))
+            .collect();
+        app.apply(
+            Action::InsertMention {
+                id: crate::mentions::ALL_ID.into(),
+                name: "all".into(),
+                start: 0,
+                end: app.composer.len(),
+            },
+            &ctx,
+        );
+        assert_eq!(
+            app.composer, "@all",
+            "a large group hides it from non-admins"
+        );
+    }
+
     #[test]
     fn dismissing_shortcut_hints_persists_and_focusing_keeps_the_draft() {
         let mut app = app();
@@ -11812,7 +13029,7 @@ mod tests {
         assert_eq!(app.display_name("1@s.whatsapp.net"), "Ada");
         assert_eq!(
             app.display_name("393331234567@s.whatsapp.net"),
-            "+39 333 123 456 7"
+            "+39 333 123 4567"
         );
         assert_eq!(app.display_name("42@lid"), "Unknown");
         app.contacts.insert(
@@ -11827,6 +13044,35 @@ mod tests {
         assert_eq!(app.display_name("42@lid"), "~Bob");
         app.me = Some("42@lid".into());
         assert_eq!(app.display_name("42@lid"), "You");
+    }
+
+    #[test]
+    fn an_archived_phone_name_is_grouped_again() {
+        // Unnamed chats keep the number as it was formatted when they were
+        // filed, which used to split every country code after two digits.
+        let mut app = app();
+        app.chats.push(Chat::new(
+            "15551234567@s.whatsapp.net".into(),
+            "+15 551 234 567".into(),
+        ));
+        app.chats.push(Chat::new(
+            "5511999999999@s.whatsapp.net".into(),
+            "+55 (11) 99999-9999".into(),
+        ));
+        assert_eq!(
+            app.display_name("15551234567@s.whatsapp.net"),
+            "+1 555 123 4567"
+        );
+        assert_eq!(
+            app.display_name("5511999999999@s.whatsapp.net"),
+            "+55 (11) 99999-9999"
+        );
+        // Without a number in the id there is nothing to format afresh.
+        app.chats
+            .push(Chat::new("42@lid".into(), "+1 555 123 4567".into()));
+        assert_eq!(app.display_name("42@lid"), "+1 555 123 4567");
+        app.chats.push(Chat::new("43@lid".into(), "43".into()));
+        assert_eq!(app.display_name("43@lid"), "Unknown");
     }
 }
 
@@ -12070,6 +13316,7 @@ mod name_tests {
         // search results alike.
         let photo = Message {
             content: Content::Image {
+                motion: None,
                 caption: Some("@987654321012345 looks sharp".into()),
                 media: Media {
                     mime: "image/jpeg".into(),
@@ -12149,6 +13396,102 @@ mod app_lock_tests {
         app.app_lock.entry = password.into();
         app.apply(Action::UnlockApp, ctx);
         finish(app, ctx);
+    }
+
+    /// A link names a chat the lock hides, and the reader asked for it from
+    /// outside, so it waits for the unlock rather than being dropped.
+    #[test]
+    fn a_link_waits_for_the_unlock() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        assert!(app.app_lock.is_locked());
+        app.chats = vec![Chat::new(CHAT.into(), "Ada Lovelace".into())];
+
+        app.apply(
+            Action::StartChat {
+                id: CHAT.into(),
+                name: "+1 555 000 0000".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: CHAT.into(),
+                text: "Invoice 123 is attached".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.open_chat, None, "the lock hides the chat");
+        assert!(
+            app.composer.is_empty(),
+            "and hides the template: {:?}",
+            app.composer
+        );
+        assert_eq!(
+            app.app_lock.deferred_request,
+            Some(crate::target::Request {
+                chat: CHAT.into(),
+                text: Some("Invoice 123 is attached".into()),
+            }),
+            "the request is kept whole"
+        );
+
+        try_password(&mut app, &ctx, PASSWORD);
+
+        assert_eq!(
+            app.open_chat.as_deref(),
+            Some(CHAT),
+            "the unlock opens what the link asked for"
+        );
+        assert_eq!(app.composer, "Invoice 123 is attached");
+        assert_eq!(app.app_lock.deferred_request, None, "and forgets it");
+    }
+
+    /// Without a password there is nothing to wait for: the link opens.
+    #[test]
+    fn a_link_opens_at_once_when_no_lock_is_set() {
+        let ctx = egui::Context::default();
+        let mut app = unlocked_app();
+        app.chats = vec![Chat::new(CHAT.into(), "Ada Lovelace".into())];
+
+        app.apply(
+            Action::StartChat {
+                id: CHAT.into(),
+                name: "+1 555 000 0000".into(),
+            },
+            &ctx,
+        );
+        app.apply(
+            Action::PrefillComposer {
+                chat: CHAT.into(),
+                text: "Invoice 123 is attached".into(),
+            },
+            &ctx,
+        );
+
+        assert_eq!(app.open_chat.as_deref(), Some(CHAT));
+        assert_eq!(app.composer, "Invoice 123 is attached");
+    }
+
+    /// Forgetting the lock forgets what was waiting on it: after unlinking
+    /// there is no chat left to open.
+    #[test]
+    fn forgetting_the_lock_forgets_a_waiting_link() {
+        let ctx = egui::Context::default();
+        let mut app = app_with(settings(Some(PASSWORD)));
+        app.apply(
+            Action::StartChat {
+                id: CHAT.into(),
+                name: "+1 555 0000".into(),
+            },
+            &ctx,
+        );
+        assert!(app.app_lock.deferred_request.is_some());
+
+        app.forget_app_lock();
+
+        assert_eq!(app.app_lock.deferred_request, None);
     }
 
     fn incoming(app: &mut App) -> Message {
@@ -12332,16 +13675,35 @@ mod app_lock_tests {
         app.window_hidden = false;
         app.window_focused = false;
         app.maybe_notify(CHAT, &message);
-        app.request_attention(&ctx);
+        app.request_attention_on(&ctx, false);
         assert!(attention_requested(&ctx));
 
         let ctx = egui::Context::default();
-        app.request_attention(&ctx);
+        app.request_attention_on(&ctx, false);
         assert!(!attention_requested(&ctx), "only once per notification");
 
         app.window_hidden = true;
         app.maybe_notify(CHAT, &message);
-        app.request_attention(&ctx);
+        app.request_attention_on(&ctx, false);
+        assert!(!attention_requested(&ctx));
+    }
+
+    /// GNOME shows its own "is ready" notice for a window that asks for
+    /// attention, on top of the message's notification (#466).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnome_gets_no_attention_request() {
+        let ctx = egui::Context::default();
+        let mut app = unlocked_app();
+        let message = incoming(&mut app);
+        app.window_hidden = false;
+        app.window_focused = false;
+        app.maybe_notify(CHAT, &message);
+        app.request_attention_on(&ctx, true);
+        assert!(!attention_requested(&ctx));
+        // The request is spent, not kept for another desktop later.
+        let ctx = egui::Context::default();
+        app.request_attention_on(&ctx, false);
         assert!(!attention_requested(&ctx));
     }
 
@@ -12366,7 +13728,7 @@ mod app_lock_tests {
         app.lock_app();
         assert!(!app.window_focused);
         app.maybe_notify(CHAT, &message);
-        app.request_attention(&ctx);
+        app.request_attention_on(&ctx, false);
         assert!(!attention_requested(&ctx));
     }
 
@@ -12380,7 +13742,7 @@ mod app_lock_tests {
         app.page = Page::Chats;
         app.open_chat = Some(CHAT.into());
         app.maybe_notify(CHAT, &message);
-        app.request_attention(&ctx);
+        app.request_attention_on(&ctx, false);
         assert!(!attention_requested(&ctx));
     }
 

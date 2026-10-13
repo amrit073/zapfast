@@ -77,6 +77,13 @@ protocol. These notes are for coding agents and new contributors.
   a disposable archive. Tests use fixtures and mock credentials only.
 - `src/model.rs` holds the app's own types. Views never touch a protobuf;
   the worker translates in `classify()` and `parse_conversation()`.
+- A motion photo is a photo plus a short clip sent as a second message in an
+  `associatedChildMessage` wrapper. The clip is never a message: its bare
+  video message goes to the archive's `motion_clips`, keyed by chat, photo id,
+  and sender, and only the photo's own sender gives it a clip. `Content::Image`
+  carries `motion`; the badge downloads the clip on a click
+  (`Command::DownloadMotion`, cache only, same limit) and plays it muted through
+  `animation::frame`; the image preview plays it through `Action::ExpandVideo`. Other wrapped children are not handled.
 - Individual **Delete for me** uses `Command::DeleteLocal` to send through
   `chat_actions().delete_message_for_me`, removing the local copy only after
   WhatsApp accepts it. `DeleteMessageForMeUpdate` applies deletions from other
@@ -182,8 +189,11 @@ protocol. These notes are for coding agents and new contributors.
   with the same `mp4` and `openh264` pieces: a thread decodes from the
   keyframe before the start (openh264 must not flush after each packet or
   B-frames stop it) and streams scaled frames with presentation times; the
-  interface thread shows the due frame in one texture. rodio's symphonia
-  decodes the AAC track and its position steers the clock. Unsupported formats
+  interface thread shows the due frame in one texture. `mp4` reads the AAC
+  track too, symphonia's AAC decoder decodes it, and rodio plays it; its
+  position steers the clock. rodio's own MP4 reader (symphonia 0.5's isomp4)
+  is not used for it: it refuses WhatsApp's videos, whose `esds` carries a
+  custom SLConfigDescriptor (#265). Unsupported formats
   go to the system player. Playback reads a downloaded local file; the shared
   64 MiB attachment download limit applies to automatic and manual downloads,
   not to the video decoder. `Action::PlayVideo/SeekVideo/ToggleVideoSound` drive
@@ -229,6 +239,18 @@ protocol. These notes are for coding agents and new contributors.
   dialog. A rename lands only after WhatsApp accepts it, and bumps
   `subject_generation` so a metadata answer asked for earlier cannot restore
   the old subject. A refusal re-asks the metadata to relearn the rights.
+- Mentioning everyone uses the visible body token `@all` and bit 1 of
+  `ContextInfo.non_jid_mentions` (`src/mentions.rs`). Localized words
+  (`@todos` in Portuguese, and the one-word alias of each other language)
+  are composer triggers only; `encode_composer_mentions` rewrites them to
+  `@all` when `Chat::can_mention_everyone` allows it: the sender can post,
+  the member list is known, and the group has at most 32 people or the
+  sender is an admin. The stored mention id is `mention-all`, not a JID.
+  Forwards and quoted copies clear that bit so the destination is not
+  notified again. A plain `@all` without the bit stays ordinary text.
+  Live edit events replace content and mentions together; caption edits keep
+  downloaded media paths. Derived archive backfills skip edited rows because
+  their retained raw protobuf still contains the original body and mentions.
 - A download that answers 403/404/410 goes through
   `client.media_reupload().request(..)` (a server-error receipt; WhatsApp
   has the phone re-upload and answers with a fresh `direct_path`) and is

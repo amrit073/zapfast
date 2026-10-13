@@ -76,23 +76,23 @@ mod clock_preference {
         gnome().unwrap_or_else(locale)
     }
 
-    /// GNOME keeps its own clock format, independent of the locale.
+    /// GNOME keeps its own clock format, independent of the locale. It is
+    /// read through the desktop portal, which works inside a Flatpak too.
     fn gnome() -> Option<bool> {
-        let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok()?;
-        if !desktop
-            .split(':')
-            .any(|name| name.eq_ignore_ascii_case("GNOME"))
-        {
+        if !fastframe_desktop::is_gnome() {
             return None;
         }
-        let output = std::process::Command::new("gsettings")
-            .args(["get", "org.gnome.desktop.interface", "clock-format"])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        match String::from_utf8_lossy(&output.stdout).trim() {
-            "'12h'" => Some(true),
-            "'24h'" => Some(false),
+        clock_format(
+            fastframe_desktop::setting("org.gnome.desktop.interface", "clock-format").as_deref(),
+        )
+    }
+
+    /// Whether GNOME's `clock-format` names a 12-hour clock, or `None` for
+    /// anything but its two values.
+    pub(super) fn clock_format(value: Option<&str>) -> Option<bool> {
+        match value? {
+            "12h" => Some(true),
+            "24h" => Some(false),
             _ => None,
         }
     }
@@ -536,15 +536,40 @@ pub fn phone(digits: &str) -> String {
     if let Some(formatted) = brazilian_phone(&digits) {
         return formatted;
     }
-    let mut out = String::from("+");
-    for (index, character) in digits.chars().enumerate() {
-        // Approximate a country code followed by groups of three digits.
-        if index == 2 || (index > 2 && (index - 2) % 3 == 0) {
-            out.push(' ');
-        }
-        out.push(character);
+    let (country, national) = digits.split_at(country_code_len(&digits).min(digits.len()));
+    let mut out = format!("+{country}");
+    // Approximate national grouping: threes, with the last four together
+    // rather than leaving a lone digit.
+    let mut start = 0;
+    while start < national.len() {
+        let end = match national.len() - start {
+            4 => national.len(),
+            _ => (start + 3).min(national.len()),
+        };
+        out.push(' ');
+        out.push_str(&national[start..end]);
+        start = end;
     }
     out
+}
+
+/// Length of the ITU-T E.164 country calling code `digits` starts with.
+///
+/// The codes are prefix-free: only 1 and 7 have one digit, the two-digit
+/// codes are listed here, and every other code has three.
+fn country_code_len(digits: &str) -> usize {
+    const TWO_DIGITS: [&str; 44] = [
+        "20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43", "44", "45", "46",
+        "47", "48", "49", "51", "52", "53", "54", "55", "56", "57", "58", "60", "61", "62", "63",
+        "64", "65", "66", "81", "82", "84", "86", "90", "91", "92", "93", "94", "95", "98",
+    ];
+    if digits.starts_with(['1', '7']) {
+        1
+    } else if TWO_DIGITS.iter().any(|code| digits.starts_with(code)) {
+        2
+    } else {
+        3
+    }
 }
 
 /// Formats Brazil's `+55` numbers as `(DDD) XXXX-XXXX` or `(DDD) XXXXX-XXXX`.
@@ -566,6 +591,11 @@ fn brazilian_phone(digits: &str) -> Option<String> {
         &subscriber[..split],
         &subscriber[split..]
     ))
+}
+
+/// The machine's hostname, or an empty string if it cannot be read.
+pub fn hostname() -> String {
+    gethostname::gethostname().to_string_lossy().into_owned()
 }
 
 /// Stable id-derived avatar hue.
@@ -715,6 +745,19 @@ mod tests {
         );
     }
 
+    /// GNOME's clock format comes from the portal as the bare value, not
+    /// the quoted text `gsettings` printed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gnome_clock_formats_are_recognized() {
+        use super::clock_preference::clock_format;
+        assert_eq!(clock_format(Some("12h")), Some(true));
+        assert_eq!(clock_format(Some("24h")), Some(false));
+        assert_eq!(clock_format(Some("'12h'")), None);
+        assert_eq!(clock_format(Some("")), None);
+        assert_eq!(clock_format(None), None);
+    }
+
     #[test]
     fn clock_patterns_from_every_platform_are_recognized() {
         for pattern in [
@@ -799,9 +842,22 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_icon_draws_without_svg_filters() {
+        // Qt's SVG renderer rejects filter primitives such as feFuncA, and a
+        // tray that asks for the themed icon then draws a missing-icon
+        // marker (#396).
+        let svg = std::str::from_utf8(MARK).expect("the icon is UTF-8");
+        assert!(!svg.contains("<filter"), "packaging/icons/zapfast.svg");
+    }
+
+    #[test]
     fn phone_numbers_are_grouped() {
-        assert_eq!(phone("393331234567"), "+39 333 123 456 7");
-        assert_eq!(phone("15551234567"), "+15 551 234 567");
+        assert_eq!(phone("393331234567"), "+39 333 123 4567");
+        assert_eq!(phone("15551234567"), "+1 555 123 4567");
+        assert_eq!(phone("79161234567"), "+7 916 123 4567");
+        assert_eq!(phone("584241234567"), "+58 424 123 4567");
+        assert_eq!(phone("2348031234567"), "+234 803 123 4567");
+        assert_eq!(phone("97150123456"), "+971 501 234 56");
         assert_eq!(phone("5511999999999"), "+55 (11) 99999-9999");
         assert_eq!(phone("551140028922"), "+55 (11) 4002-8922");
         assert_eq!(phone("551149508333"), "+55 (11) 4950-8333");

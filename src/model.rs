@@ -293,6 +293,17 @@ impl Chat {
         self.is_group() && !self.left && (self.admin || self.info_locked == Some(false))
     }
 
+    /// Whether we may mention everyone. A group of at most
+    /// [`crate::mentions::OPEN_LIMIT`] people allows any member who can post.
+    /// A larger group allows only admins. An empty member list means the
+    /// phone has not said who is in, so nothing is offered yet.
+    pub fn can_mention_everyone(&self) -> bool {
+        self.is_group()
+            && self.can_send()
+            && !self.participants.is_empty()
+            && (self.participants.len() <= crate::mentions::OPEN_LIMIT || self.admin)
+    }
+
     /// Whether the member list names any of `ours`.
     pub fn lists_any(&self, ours: &[&str]) -> bool {
         self.participants
@@ -434,6 +445,9 @@ pub enum Content {
     Image {
         caption: Option<String>,
         media: Media,
+        /// The short clip of a motion photo.
+        #[serde(default)]
+        motion: Option<Motion>,
     },
     Video {
         caption: Option<String>,
@@ -502,6 +516,12 @@ pub enum Content {
         /// message keeps its start time so updates do not reorder the chat.
         #[serde(default)]
         updated: i64,
+        /// Whether the sender's phone has posted positions this device cannot
+        /// read. WhatsApp keeps live locations off linked devices, so the
+        /// card holds the last position it was given and says where the
+        /// newer ones are.
+        #[serde(default)]
+        newer_on_phone: bool,
     },
     Contact {
         display_name: String,
@@ -856,6 +876,15 @@ impl Content {
             new.path = old.path.clone();
         }
         if let (
+            Self::Image { motion: new, .. },
+            Self::Image {
+                motion: Some(old), ..
+            },
+        ) = (&mut *self, old)
+        {
+            *new = Some(old.clone());
+        }
+        if let (
             Self::Interactive {
                 card: Some(new), ..
             },
@@ -935,6 +964,17 @@ impl Media {
     pub fn is_within_download_limit(&self) -> bool {
         self.size <= ATTACHMENT_DOWNLOAD_LIMIT
     }
+}
+
+/// A motion photo's clip. Its download keys stay in the archive.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Motion {
+    /// Decrypted downloaded file.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Non-persisted download state.
+    #[serde(skip)]
+    pub state: MediaState,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1356,11 +1396,23 @@ pub enum Action {
     Open(Page),
     /// Opens settings, or closes them when they are already showing.
     ToggleSettings,
+    /// Steps back to the previously visited page, chat, or dialog, as a
+    /// browser's back button does.
+    NavigateBack,
+    /// Steps forward again after a back step.
+    NavigateForward,
     OpenChat(ChatId),
     /// Creates and opens a chat for a contact without one.
     StartChat {
         id: ChatId,
         name: String,
+    },
+    /// Puts a template in the named chat's composer without sending it, the
+    /// way a share link's `text=` asks. Carries the chat it belongs to, since
+    /// a chat the app refuses to open must not put its text in another one.
+    PrefillComposer {
+        chat: ChatId,
+        text: String,
     },
     /// Opens a chat at a message search result.
     OpenMessage {
@@ -1425,6 +1477,17 @@ pub enum Action {
     },
     Download {
         card: Option<usize>,
+        chat: ChatId,
+        message: String,
+    },
+    /// Downloads a motion photo's clip.
+    DownloadMotion {
+        chat: ChatId,
+        message: String,
+    },
+    /// Plays a motion photo's clip over its photo, downloading it first, or
+    /// goes back to the photo.
+    ToggleMotion {
         chat: ChatId,
         message: String,
     },
@@ -1867,6 +1930,7 @@ mod tests {
         );
         // A caption is searched too, and previewed the same way.
         let photo = super::Content::Image {
+            motion: None,
             caption: Some("a photo of a Zebra".into()),
             media: media(),
         };
@@ -1920,6 +1984,36 @@ mod tests {
         direct.info_locked = Some(false);
         direct.admin = true;
         assert!(!direct.can_edit_info(), "only groups have group info");
+    }
+
+    #[test]
+    fn mentioning_everyone_is_open_to_small_groups_and_admins() {
+        let mut chat = super::Chat::new("1-2@g.us".into(), "Rust".into());
+        assert!(
+            !chat.can_mention_everyone(),
+            "an unknown member list offers nothing"
+        );
+        chat.participants = vec!["1@s.whatsapp.net".into()];
+        assert!(chat.can_mention_everyone());
+        chat.participants = (0..32).map(|n| format!("{n}@s.whatsapp.net")).collect();
+        assert!(
+            chat.can_mention_everyone(),
+            "32 people still count as small"
+        );
+        chat.participants.push("32@s.whatsapp.net".into());
+        assert!(!chat.can_mention_everyone(), "a larger group is for admins");
+        chat.admin = true;
+        assert!(chat.can_mention_everyone());
+        chat.read_only = true;
+        assert!(!chat.can_mention_everyone(), "a chat we cannot post in");
+        chat.read_only = false;
+        chat.left = true;
+        assert!(!chat.can_mention_everyone());
+
+        let mut direct = super::Chat::new("1@s.whatsapp.net".into(), "Ada".into());
+        direct.participants = vec!["1@s.whatsapp.net".into()];
+        direct.admin = true;
+        assert!(!direct.can_mention_everyone());
     }
 
     #[test]
@@ -2135,6 +2229,7 @@ mod tests {
         assert_eq!(Content::text("hi\nthere").summary(), "hi");
         assert_eq!(
             Content::Image {
+                motion: None,
                 caption: Some("look".into()),
                 media: media()
             }
@@ -2143,6 +2238,7 @@ mod tests {
         );
         assert_eq!(
             Content::Image {
+                motion: None,
                 caption: None,
                 media: media()
             }
@@ -2166,6 +2262,7 @@ mod tests {
         assert_eq!(Content::text("hi\nthere").full_summary(), "hi\nthere");
         assert_eq!(
             Content::Image {
+                motion: None,
                 caption: Some("look\nat this".into()),
                 media: media()
             }
@@ -2240,6 +2337,7 @@ mod tests {
             sequence: 7,
             ended: true,
             updated: 1_700_000_000,
+            newer_on_phone: true,
         };
         let json = serde_json::to_string(&content).expect("serializes");
         let back: Content = serde_json::from_str(&json).expect("parses");
@@ -2259,6 +2357,7 @@ mod tests {
                 sequence: 0,
                 ended: false,
                 updated: 0,
+                newer_on_phone: false,
             }
         );
     }
@@ -2274,6 +2373,7 @@ mod tests {
             sequence: 1,
             ended,
             updated: 0,
+            newer_on_phone: false,
         };
         assert!(!live(false).live_location_over(1_000, 1_000 + LIVE_LOCATION_LIMIT));
         assert!(live(false).live_location_over(1_000, 1_001 + LIVE_LOCATION_LIMIT));

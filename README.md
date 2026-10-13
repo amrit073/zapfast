@@ -23,6 +23,8 @@ https://github.com/user-attachments/assets/2bf86b54-45fc-4add-8de7-c426c3cdad9b
 - [Settings & files](https://zapfast.rocks/settings-and-files/): where your data lives, encryption, app lock, updates
 - [Making a theme](https://zapfast.rocks/themes/)
 
+Phone numbers in message text open actions to start a chat or copy the displayed number.
+
 **Want Spotify just as fast and native?** [Spotifast](https://spotifast.rocks)
 is ZapFast's sibling. Both are built on
 [fastframe](https://github.com/crmne/fastframe).
@@ -42,7 +44,8 @@ source, see [Getting started](https://zapfast.rocks/getting-started/).
 ## Developing
 
 ```sh
-cargo run --features demo -- --demo   # offline sample chats, no WhatsApp connection
+cargo run --features demo -- --demo            # offline sample chats, no WhatsApp connection
+cargo run --features demo -- --demo-page phone-menu
 ```
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers issues, pull requests, and checks;

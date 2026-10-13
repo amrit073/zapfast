@@ -59,7 +59,8 @@ The packaged desktop entry is `packaging/applications/zapfast.desktop`;
 ZapFast links as a companion device, like WhatsApp Web. Start it and either:
 
 - scan the QR code with your phone (WhatsApp, **Settings**, **Linked
-  devices**, **Link a device**), or
+  devices**, **Link a device**). The phone's camera app also reads the code
+  and opens **Linked devices** in WhatsApp, or
 - click **Link with phone number** and enter the eight-character code on your
   phone.
 
@@ -69,7 +70,8 @@ network or be online to read messages already stored in ZapFast.
 Several numbers can stay linked in one window. Click your own picture at the
 top of the chat list to switch between them or to add another (**Settings >
 Account > Add account** works too); a dot on it means another number has
-unread chats. Each number keeps its own keys, archive, media, and
+unread chats. `Ctrl+Shift+A` (Command+Shift+A on macOS) switches to the next
+number. Each number keeps its own keys, archive, media, and
 notification, receipt, download, and wallpaper settings.
 
 ## Message history

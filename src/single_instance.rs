@@ -41,7 +41,7 @@ pub enum Outcome {
 }
 
 /// Request from another launch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlCommand {
     /// Shows or creates the window.
     Show,
@@ -49,6 +49,8 @@ pub enum ControlCommand {
     ReloadThemes,
     /// Confirms an instance is running and changes nothing.
     Ping,
+    /// Opens the chat a link named, showing the window as it does.
+    OpenChat(crate::target::Request),
 }
 
 type Queue = Arc<Mutex<Vec<ControlCommand>>>;
@@ -85,7 +87,15 @@ pub fn acquire(dir: &Path, waker: &crate::backend::Waker, verb: &str) -> Outcome
             return Outcome::Unanswered;
         }
     };
-    if legacy_instance_answers(verb) {
+    // A copy from before the lock only knows `show` and `ping`. A chat asked
+    // of one surfaces its window rather than running a second ZapFast beside
+    // it on the same archive and linked device.
+    let legacy = if verb.starts_with("open ") {
+        "show"
+    } else {
+        verb
+    };
+    if legacy_instance_answers(legacy) {
         return Outcome::Surfaced;
     }
     listen_legacy(Arc::clone(&commands), waker.clone());
@@ -122,7 +132,13 @@ pub fn send(dir: &Path, verb: &str) -> std::io::Result<()> {
 }
 
 /// The verbs another launch may send. Anything else is declined.
+///
+/// `open` carries the whole request, so it is read and held to the same rule
+/// [`crate::target::parse`] applies rather than being trusted as it arrives.
 fn parse(verb: &str) -> Option<ControlCommand> {
+    if let Some(request) = verb.strip_prefix("open ") {
+        return crate::target::Request::from_verb(request).map(ControlCommand::OpenChat);
+    }
     match verb {
         "show" => Some(ControlCommand::Show),
         "reload-themes" => Some(ControlCommand::ReloadThemes),
@@ -246,6 +262,23 @@ mod tests {
         assert_eq!(parse("show"), Some(ControlCommand::Show));
         assert_eq!(parse("ping"), Some(ControlCommand::Ping));
         assert_eq!(parse("reload-themes"), Some(ControlCommand::ReloadThemes));
+        assert_eq!(
+            parse("open 20123456789@s.whatsapp.net"),
+            Some(ControlCommand::OpenChat(crate::target::Request {
+                chat: "20123456789@s.whatsapp.net".into(),
+                text: None
+            }))
+        );
+        assert_eq!(
+            parse("open 20123456789@s.whatsapp.net\tHello%20there"),
+            Some(ControlCommand::OpenChat(crate::target::Request {
+                chat: "20123456789@s.whatsapp.net".into(),
+                text: Some("Hello there".into())
+            }))
+        );
+        // A chat this copy would not have opened is declined, not acted on.
+        assert_eq!(parse("open 20123456789@lid"), None);
+        assert_eq!(parse("open"), None);
         assert_eq!(parse("GET / HTTP/1.1"), None);
         assert_eq!(parse("frobnicate"), None);
         assert_eq!(parse(""), None);
