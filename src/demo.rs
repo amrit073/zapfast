@@ -2436,11 +2436,11 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     pairing_phone: None,
                 };
             }
-            "pair" => {
+            "pair" | "pair-requesting" => {
                 unlink(app);
                 app.link = LinkStatus::Unlinked {
                     qr: None,
-                    pair_code: Some("FWAP1234".into()),
+                    pair_code: (part == "pair").then(|| "FWAP1234".into()),
                     pairing_phone: Some("15550001111".into()),
                 };
             }
@@ -4661,7 +4661,7 @@ mod tests {
             apply_flags(&mut app, Some(page));
             render(&mut app, &ctx);
         }
-        for page in ["login", "pair", "phone"] {
+        for page in ["login", "pair", "pair-requesting", "phone"] {
             let mut app = self::app();
             apply_flags(&mut app, Some(page));
             render(&mut app, &ctx);

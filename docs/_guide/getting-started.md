@@ -64,6 +64,14 @@ ZapFast links as a companion device, like WhatsApp Web. Start it and either:
 - click **Link with phone number** and enter the eight-character code on your
   phone.
 
+Submitting a phone number closes the number dialog and shows the requested code.
+Enter that code on your phone. To replace it, choose **Get another code** and submit
+the number again; the previous code is cancelled. Closing the number dialog
+without submitting keeps the existing code valid. Repeated clicks while a request
+is pending do not create extra requests. If WhatsApp asks for a refresh, request a
+new code explicitly. A failed request may still be rate-limited by WhatsApp, so
+avoid repeatedly requesting replacements.
+
 The link survives restarts. Your phone does not need to stay on the same
 network or be online to read messages already stored in ZapFast.
 

@@ -1275,7 +1275,7 @@ fn pair_with_phone(app: &mut App, ui: &mut egui::Ui) {
     title(ui, app, "Link with a phone number");
     theme::paragraph(
         ui,
-        "Enter the WhatsApp phone number with its country code. Do not include a plus sign or leading zero. You will get a code to enter on the phone.",
+        "Enter the WhatsApp phone number with its country code. Do not include a plus sign or leading zero. Requesting a new code replaces the previous one.",
         theme::regular(13.0),
         palette.secondary,
     );
@@ -1318,7 +1318,12 @@ fn pair_with_phone(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let ready = app.pair_phone.chars().filter(char::is_ascii_digit).count() >= 7;
+            let digits: String = app
+                .pair_phone
+                .chars()
+                .filter(char::is_ascii_digit)
+                .collect();
+            let ready = crate::backend::valid_pair_phone(&digits);
             // Stay the main action, but look and read as unavailable until
             // the number is long enough.
             let get_code = ui

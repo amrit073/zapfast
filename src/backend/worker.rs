@@ -20,7 +20,6 @@ use whatsapp_rust::media::{
     image_message, video_message,
 };
 use whatsapp_rust::pair::NATIVE_CAMERA_DEEP_LINK_PREFIX;
-use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::prelude::{
     Bot, BotHandle, Client, Jid, MessageBuilderExt, MessageExt, MessageField, SendOptions, wa,
 };
@@ -43,6 +42,7 @@ mod channel_pictures;
 mod contact_names;
 mod device_store;
 mod early_events;
+mod phone_pairing;
 use early_events::WaitingReaction;
 mod favorite_chats;
 mod interactive;
@@ -521,6 +521,7 @@ pub async fn run(
         status: LinkStatus::Starting,
         pairing_phone: None,
         pair_code: None,
+        pair_request: None,
         qr: None,
         syncing: false,
         sync_deadline: None,
@@ -591,6 +592,7 @@ pub async fn run(
             }
             Some(event) = wa_events.recv() => match event {
                 RuntimeEvent::WhatsApp(event) => worker.handle_wa_event(event).await,
+                RuntimeEvent::PairCode { request, result } => worker.finish_pair_code(request, result),
                 RuntimeEvent::MessageRemoval { generation, event } => {
                     worker.handle_session_deletion(generation, event).await;
                 }
@@ -642,6 +644,11 @@ pub async fn run(
 }
 
 enum RuntimeEvent {
+    // Keep completion behind the library events it emitted on the same FIFO.
+    PairCode {
+        request: u64,
+        result: Result<String, String>,
+    },
     WhatsApp(Arc<wa_events::Event>),
     MessageRemoval {
         generation: u64,
@@ -840,6 +847,7 @@ struct Worker {
     status: LinkStatus,
     pairing_phone: Option<String>,
     pair_code: Option<String>,
+    pair_request: Option<(u64, tokio::task::JoinHandle<()>)>,
     qr: Option<String>,
     syncing: bool,
     sync_deadline: Option<Instant>,
@@ -2033,6 +2041,7 @@ impl Worker {
     }
 
     async fn stop_bot(&mut self) {
+        self.stop_pair_request();
         self.stop_call_for_disconnect("Call ended: connection closed")
             .await;
         self.client = None;
@@ -2496,20 +2505,32 @@ impl Worker {
                 let status = self.unlinked();
                 self.set_status(status);
             }
-            E::PairingCode(code) => {
-                self.pair_code = Some(code.code.clone());
-                let status = self.unlinked();
-                self.set_status(status);
-            }
+            // Direct requests return through the correlated PairCode runtime event.
+            // The library also emits this event; accepting both could revive
+            // a cancelled request or overwrite a newer code.
+            E::PairingCode(_) => {}
             E::PairingCodeError(error) => {
-                self.pair_code = None;
-                self.pairing_phone = None;
-                self.emit(Event::Error(format!(
-                    "Could not link by phone number: {}",
-                    error.error
-                )));
-                let status = self.unlinked();
-                self.set_status(status);
+                if self.pair_request.is_none() && self.pair_code.is_some() {
+                    self.pair_code = None;
+                    self.pairing_phone = None;
+                    self.emit(Event::Error(format!(
+                        "Could not link by phone number: {}",
+                        error.error
+                    )));
+                    let status = self.unlinked();
+                    self.set_status(status);
+                }
+            }
+            E::PairingCodeRefresh(_) => {
+                if self.pair_request.is_none() && self.pair_code.is_some() {
+                    self.pair_code = None;
+                    self.pairing_phone = None;
+                    self.emit(Event::Info(
+                        "The phone-linking code is no longer valid. Request another code.".into(),
+                    ));
+                    let status = self.unlinked();
+                    self.set_status(status);
+                }
             }
             E::PairingQrCodesExhausted(exhausted) => {
                 self.qr = None;
@@ -2522,6 +2543,7 @@ impl Worker {
                 }
             }
             E::PairSuccess(pair) => {
+                self.stop_pair_request();
                 self.qr = None;
                 self.pair_code = None;
                 self.pairing_phone = None;
@@ -2529,6 +2551,7 @@ impl Worker {
                 self.set_status(LinkStatus::Connecting);
             }
             E::Connected(_) => {
+                self.stop_pair_request();
                 let (pn, lid, name) = match &self.client {
                     Some(client) => (client.pn(), client.lid(), Some(client.push_name())),
                     None => (None, None, None),
@@ -5997,42 +6020,7 @@ impl Worker {
                     .map_err(|error| error.to_string())
                 });
             }
-            Command::PairWithPhone(phone) => {
-                let Some(client) = self.client.clone() else {
-                    self.emit(Event::Error("Not connected to WhatsApp yet".to_owned()));
-                    return;
-                };
-                self.pairing_phone = Some(phone.clone());
-                self.pair_code = None;
-                let status = self.unlinked();
-                self.set_status(status);
-                let commands = self.commands.clone();
-                tokio::spawn(async move {
-                    let result = client
-                        .pair_with_code(PairCodeOptions {
-                            phone_number: phone,
-                            ..Default::default()
-                        })
-                        .await
-                        .map_err(|error| error.to_string());
-                    let _ = commands.send(Command::PairCode { result });
-                });
-            }
-            Command::PairCode { result } => match result {
-                Ok(code) => {
-                    self.pair_code = Some(code);
-                    let status = self.unlinked();
-                    self.set_status(status);
-                }
-                Err(error) => {
-                    self.pairing_phone = None;
-                    self.emit(Event::Error(format!(
-                        "Could not link by phone number: {error}"
-                    )));
-                    let status = self.unlinked();
-                    self.set_status(status);
-                }
-            },
+            Command::PairWithPhone(phone) => self.request_pair_code(phone),
             Command::Unlink => {
                 if let Some(client) = self.client.clone() {
                     client.logout().await;
@@ -13019,6 +13007,7 @@ mod receipt_tests {
             status: LinkStatus::Connected,
             pairing_phone: None,
             pair_code: None,
+            pair_request: None,
             qr: None,
             syncing: false,
             sync_deadline: None,

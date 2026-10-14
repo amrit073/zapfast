@@ -27,6 +27,13 @@ pub enum MessageRemovalOutcome {
     Uncertain,
 }
 
+/// Validate an international number before replacing an existing pairing flow.
+pub fn valid_pair_phone(phone: &str) -> bool {
+    (7..=15).contains(&phone.len())
+        && !phone.starts_with('0')
+        && phone.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// Phone-link state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkStatus {
@@ -741,10 +748,6 @@ pub enum Command {
         /// The chat's rename generation when this metadata was asked for. A
         /// snapshot older than a rename made here cannot restore the old name.
         subject_generation: u64,
-    },
-    /// Internal pairing-code result.
-    PairCode {
-        result: Result<String, String>,
     },
     /// Internal account read-receipt setting.
     ReceiptsPrivacy {

@@ -5587,7 +5587,12 @@ impl App {
                     self.forward_search.clear();
                 }
                 if dialog == Dialog::PairWithPhone {
-                    self.pair_phone.clear();
+                    self.pair_phone = match &self.link {
+                        LinkStatus::Unlinked { pairing_phone, .. } => {
+                            pairing_phone.clone().unwrap_or_default()
+                        }
+                        _ => String::new(),
+                    };
                 }
                 if dialog == Dialog::NewContact {
                     self.contact_lookup = None;
@@ -6087,12 +6092,36 @@ impl App {
                 self.mark_settings_dirty();
             }
             Action::PairWithPhone(phone) => {
+                if self.link.is_connected()
+                    || matches!(
+                        &self.link,
+                        LinkStatus::Unlinked {
+                            pairing_phone: Some(_),
+                            pair_code: None,
+                            ..
+                        }
+                    )
+                {
+                    return;
+                }
                 let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
-                if digits.len() < 7 {
-                    self.toast_error(
-                        "Enter the phone number with its country code, using digits only",
-                    );
+                if !crate::backend::valid_pair_phone(&digits) {
+                    self.toast_error("Enter the whole phone number with its country code, without a leading zero.");
                 } else {
+                    // Close immediately and mark the request before the next frame,
+                    // so a double click or repeated Enter cannot replace it.
+                    if self.dialog == Some(Dialog::PairWithPhone) {
+                        self.dialog = None;
+                    }
+                    let qr = match &self.link {
+                        LinkStatus::Unlinked { qr, .. } => qr.clone(),
+                        _ => None,
+                    };
+                    self.link = LinkStatus::Unlinked {
+                        qr,
+                        pair_code: None,
+                        pairing_phone: Some(digits.clone()),
+                    };
                     self.backend.send(Command::PairWithPhone(digits));
                 }
             }
@@ -8365,6 +8394,41 @@ mod tests {
             [false; 0],
             "a chat at its start is not asked again"
         );
+    }
+
+    #[test]
+    fn phone_pairing_closes_the_dialog_and_submits_only_once() {
+        let mut app = app();
+        let (backend, mut commands) = Backend::recording();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        app.link = LinkStatus::Unlinked {
+            qr: Some("synthetic".into()),
+            pair_code: None,
+            pairing_phone: None,
+        };
+        app.apply(Action::ShowDialog(Dialog::PairWithPhone), &ctx);
+        app.apply(Action::PairWithPhone("+1 555 000 1111".into()), &ctx);
+        app.apply(Action::PairWithPhone("15550001111".into()), &ctx);
+        assert!(app.dialog.is_none());
+        assert!(
+            matches!(commands.try_recv().unwrap(), Command::PairWithPhone(phone) if phone == "15550001111")
+        );
+        assert!(commands.try_recv().is_err());
+        app.link = LinkStatus::Unlinked {
+            qr: None,
+            pair_code: Some("ABCD1234".into()),
+            pairing_phone: Some("15550001111".into()),
+        };
+        app.apply(Action::ShowDialog(Dialog::PairWithPhone), &ctx);
+        assert_eq!(app.pair_phone, "15550001111");
+        app.apply(Action::CloseDialog, &ctx);
+        assert!(
+            matches!(&app.link, LinkStatus::Unlinked { pair_code: Some(code), .. } if code == "ABCD1234")
+        );
+        assert!(commands.try_recv().is_err());
+        app.apply(Action::PairWithPhone("015550001111".into()), &ctx);
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]
