@@ -34,6 +34,10 @@ const LEAD: Duration = Duration::from_millis(400);
 const UNSEEN: Duration = Duration::from_millis(1500);
 /// Longest wait between repaints while a video plays, for the progress.
 const TICK: Duration = Duration::from_millis(40);
+/// How long a video plays silently after its sound output failed before the
+/// sound is opened again, doubling up to the longest with each failure.
+const SOUND_RETRY: Duration = Duration::from_secs(1);
+const SOUND_RETRY_LONGEST: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -83,21 +87,41 @@ enum Delivery {
     Unsupported(String),
 }
 
-/// Playback time: wall time while no sound steers it.
+/// Playback time: wall time, scaled by the playback speed, while no sound
+/// steers it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Clock {
     /// Position when the clock last stopped or jumped.
     anchor: Duration,
     /// When it started running from `anchor`, while it runs.
     since: Option<Instant>,
+    /// Video time per wall time in thousandths; 0 is the default 1x.
+    permille: u32,
 }
 
 impl Clock {
     pub fn position(&self, now: Instant) -> Duration {
         self.anchor
-            + self
-                .since
-                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+            + self.since.map_or(Duration::ZERO, |since| {
+                now.saturating_duration_since(since).mul_f64(self.rate())
+            })
+    }
+
+    fn rate(&self) -> f64 {
+        if self.permille == 0 {
+            1.0
+        } else {
+            f64::from(self.permille) / 1000.0
+        }
+    }
+
+    /// Runs at `speed` times wall time from here on, without a jump.
+    pub fn set_speed(&mut self, speed: f32, now: Instant) {
+        self.anchor = self.position(now);
+        if self.since.is_some() {
+            self.since = Some(now);
+        }
+        self.permille = (speed.max(0.0) * 1000.0).round() as u32;
     }
 
     pub fn running(&self) -> bool {
@@ -176,18 +200,80 @@ pub fn arc(center: egui::Pos2, radius: f32, fraction: f32) -> Vec<egui::Pos2> {
 
 /// The sound of the playing video on the default output device.
 struct Sound {
-    device: rodio::MixerDeviceSink,
+    device: crate::audio::Output,
     sink: rodio::Player,
-    /// Video time the queued decoder started from.
+    /// Video time the queued sound starts from.
     base: Duration,
+    /// Video time per second of queued sound: the playback speed.
+    factor: f32,
+}
+
+/// A video's sound compressed by its playback speed as it plays, with the
+/// voice messages' pitch-keeping stretch, every channel kept: only a few
+/// thousand frames are held, never the rest of the track.
+struct Stretched {
+    stream: crate::timestretch::Stream<AacTrack>,
+    channels: rodio::ChannelCount,
+    rate: rodio::SampleRate,
+    total: Duration,
+}
+
+impl Stretched {
+    fn new(track: AacTrack, factor: f32) -> Self {
+        let channels = rodio::Source::channels(&track);
+        let rate = rodio::Source::sample_rate(&track);
+        let total = track.total.div_f32(factor);
+        Self {
+            stream: crate::timestretch::Stream::new(track, usize::from(channels.get()), factor),
+            channels,
+            rate,
+            total,
+        }
+    }
+}
+
+impl Iterator for Stretched {
+    type Item = rodio::Sample;
+
+    fn next(&mut self) -> Option<rodio::Sample> {
+        self.stream.next()
+    }
+}
+
+impl rodio::Source for Stretched {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> rodio::ChannelCount {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> rodio::SampleRate {
+        self.rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        Some(self.total)
+    }
+}
+
+/// Queues `track` on `sink` at `speed`: as decoded at 1x, streamed through
+/// the stretch above it.
+fn queue_sound(sink: &rodio::Player, track: AacTrack, speed: f32) {
+    if speed > 1.0 {
+        sink.append(Stretched::new(track, speed));
+    } else {
+        sink.append(track);
+    }
 }
 
 impl Sound {
     /// Opens the file's sound, paused at `from`. A video without a sound
     /// track, or a computer without an output device, plays silently.
-    fn open(path: &Path, from: Duration, muted: bool) -> Option<Self> {
+    fn open(path: &Path, from: Duration, muted: bool, speed: f32) -> Option<Self> {
         let decoder = sound_decoder(path, from)?;
-        let device = match crate::audio::open_output() {
+        let device = match crate::audio::open_output(None) {
             Ok(device) => device,
             Err(error) => {
                 log::warn!("video plays without sound: {error}");
@@ -197,31 +283,40 @@ impl Sound {
         let sink = rodio::Player::connect_new(device.mixer());
         sink.pause();
         sink.set_volume(if muted { 0.0 } else { 1.0 });
-        sink.append(decoder);
+        queue_sound(&sink, decoder, speed);
         Some(Self {
             device,
             sink,
             base: from,
+            factor: speed.max(1.0),
         })
     }
 
-    /// Queues the sound again from `from`, paused. A fresh player keeps the
-    /// seek off the audio thread, which `Player::try_seek` would wait for.
-    fn restart(&mut self, path: &Path, from: Duration, muted: bool) {
+    /// Queues the sound again from `from` at `speed`, paused. A fresh player
+    /// keeps the seek off the audio thread, which `Player::try_seek` would
+    /// wait for.
+    fn restart(&mut self, path: &Path, from: Duration, muted: bool, speed: f32) {
         let sink = rodio::Player::connect_new(self.device.mixer());
         sink.pause();
         sink.set_volume(if muted { 0.0 } else { 1.0 });
         if let Some(decoder) = sound_decoder(path, from) {
-            sink.append(decoder);
+            queue_sound(&sink, decoder, speed);
         }
         self.sink = sink;
         self.base = from;
+        self.factor = speed.max(1.0);
     }
 
     /// Position of the sound in the video, while there is sound left.
     fn position(&self) -> Option<Duration> {
-        (!self.sink.empty()).then(|| self.base + self.sink.get_pos())
+        (!self.sink.empty()).then(|| sound_position(self.base, self.sink.get_pos(), self.factor))
     }
+}
+
+/// The video time reached after `played` of sound queued from `base` at
+/// `factor` times speed: each second heard covers `factor` of the video.
+fn sound_position(base: Duration, played: Duration, factor: f32) -> Duration {
+    base + played.mul_f32(factor)
 }
 
 fn sound_decoder(path: &Path, from: Duration) -> Option<AacTrack> {
@@ -471,6 +566,9 @@ struct Session {
     texture: Option<TextureHandle>,
     clock: Clock,
     sound: Option<Sound>,
+    /// When to open the sound again after its output failed (#507), and how
+    /// long the wait after the next failure will be.
+    sound_retry: Option<(Instant, Duration)>,
     total: Duration,
     /// Longest side of the frames the decoder in use sends.
     side: u32,
@@ -515,6 +613,40 @@ impl Session {
         }
     }
 
+    /// Drops a sound whose output keeps failing (#507), and opens it again at
+    /// the clock's position after a wait that doubles with each failure, so
+    /// the video plays on silently in between.
+    fn recover_sound(&mut self, now: Instant, muted: bool, speed: f32) {
+        if self
+            .sound
+            .as_ref()
+            .is_some_and(|sound| sound.device.failed())
+        {
+            self.sound = None;
+            self.retry_sound(now);
+        }
+        let Some((at, _)) = self.sound_retry else {
+            return;
+        };
+        if self.sound.is_some() || now < at {
+            return;
+        }
+        self.sound = Sound::open(&self.path, self.clock.position(now), muted, speed);
+        match &self.sound {
+            Some(sound) if self.state == State::Playing => sound.sink.play(),
+            Some(_) => {}
+            None => self.retry_sound(now),
+        }
+    }
+
+    fn retry_sound(&mut self, now: Instant) {
+        let wait = self
+            .sound_retry
+            .map_or(SOUND_RETRY, |(_, wait)| (wait * 2).min(SOUND_RETRY_LONGEST));
+        log::warn!("video sound lost; trying again in {wait:?}");
+        self.sound_retry = Some((now + wait, wait));
+    }
+
     fn show(&mut self, ctx: &egui::Context, image: ColorImage) {
         match &mut self.texture {
             Some(texture) => texture.set(image, TextureOptions::LINEAR),
@@ -538,6 +670,8 @@ pub struct Player {
     /// Longest side frames are decoded to: larger while the video covers
     /// the window.
     side: u32,
+    /// Playback speed, kept from one video to the next.
+    speed: f32,
 }
 
 impl Player {
@@ -549,6 +683,38 @@ impl Player {
             audible: true,
             seen: Cell::new(Instant::now()),
             side: MAX_SIDE,
+            speed: 1.0,
+        }
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.speed
+    }
+
+    /// Plays at the next of 1x, 1.5x and 2x, as the voice message chip does.
+    pub fn cycle_speed(&mut self) {
+        self.set_speed(crate::audio::next_cycled_speed(self.speed));
+    }
+
+    /// Plays at `speed`, carrying on from where the video stands.
+    pub fn set_speed(&mut self, speed: f32) {
+        let speed = crate::audio::supported_speed(speed);
+        if speed == self.speed {
+            return;
+        }
+        self.speed = speed;
+        let muted = self.muted;
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        session.clock.set_speed(speed, now);
+        let position = session.clock.position(now);
+        if let Some(sound) = &mut session.sound {
+            sound.restart(&session.path, position, muted, speed);
+            if session.state == State::Playing {
+                sound.sink.play();
+            }
         }
     }
 
@@ -613,8 +779,9 @@ impl Player {
         session.side = side;
         session.resize = None;
         session.frames = spawn_decoder(&session.path, to, side, self.waker.clone());
+        let speed = self.speed;
         if let Some(sound) = &mut session.sound {
-            sound.restart(&session.path, to, muted);
+            sound.restart(&session.path, to, muted, speed);
         }
     }
 
@@ -739,6 +906,7 @@ impl Player {
         self.seen.set(now);
         let mut clock = Clock::default();
         clock.seek(from, now);
+        clock.set_speed(self.speed, now);
         self.session = Some(Session {
             message: message.to_owned(),
             path: path.to_owned(),
@@ -751,8 +919,9 @@ impl Player {
             clock,
             sound: self
                 .audible
-                .then(|| Sound::open(path, from, self.muted))
+                .then(|| Sound::open(path, from, self.muted, self.speed))
                 .flatten(),
+            sound_retry: None,
             total: Duration::ZERO,
             side: self.side,
             resize: None,
@@ -824,6 +993,7 @@ impl Player {
                 return None;
             }
         }
+        session.recover_sound(now, self.muted, self.speed);
         if session.state != State::Playing {
             return None;
         }
@@ -1152,6 +1322,50 @@ impl Output<'_> {
     }
 }
 
+/// Converts a YUV 4:2:0 picture to RGB, scaled to `out` when it differs from `size`.
+///
+/// Shared with the call screen, which has raw camera planes and decoded peer frames rather than a
+/// whole file to play. `turns` is quarter turns clockwise to apply while converting; a call passes
+/// [`orientation_turns`] of the peer's `device_orientation`, and `out` stays the size the picture
+/// has *before* those turns, since the rotation swaps the result's sides.
+pub(crate) fn rgb_image(
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+    strides: (usize, usize, usize),
+    size: (usize, usize),
+    out: (usize, usize),
+    turns: u8,
+) -> ColorImage {
+    convert(
+        &Planes {
+            y,
+            u,
+            v,
+            strides,
+            size,
+        },
+        out,
+        turns,
+    )
+}
+
+/// How many quarter turns clockwise a peer's `device_orientation` asks the picture to take.
+///
+/// WhatsApp's low two bits are a counter-clockwise quarter-turn count, not a clockwise one: the
+/// shipped web renderer applies `rotate(Math.PI * (orientation - 1) / 2)`, and whatsapp-rust's own
+/// `voip-cli` example undoes the same value with `transpose=cclock` for 1 and `transpose=clock`
+/// for 3 (`examples/voip-cli/src/video.rs`). [`convert`] turns clockwise, so the count flips; 2 is
+/// its own inverse. Anything else, including the 0 an upright camera reports, is no turn at all.
+pub(crate) fn orientation_turns(orientation: u8) -> u8 {
+    match orientation & 0x03 {
+        1 => 3,
+        2 => 2,
+        3 => 1,
+        _ => 0,
+    }
+}
+
 /// Turns one decoded frame into an upright picture no larger than `side`
 /// on its longest side.
 fn picture(yuv: &openh264::decoder::DecodedYUV<'_>, turns: u8, side: u32) -> Option<ColorImage> {
@@ -1441,6 +1655,71 @@ mod tests {
     }
 
     #[test]
+    fn clock_runs_faster_at_a_higher_speed_without_a_jump() {
+        let start = Instant::now();
+        let mut clock = Clock::default();
+        clock.resume(start);
+        let second = start + Duration::from_secs(1);
+        clock.set_speed(2.0, second);
+        assert_eq!(clock.position(second), Duration::from_secs(1));
+        assert_eq!(
+            clock.position(second + Duration::from_secs(2)),
+            Duration::from_secs(5)
+        );
+        clock.set_speed(1.0, second + Duration::from_secs(2));
+        assert_eq!(
+            clock.position(second + Duration::from_secs(3)),
+            Duration::from_secs(6)
+        );
+    }
+
+    #[test]
+    fn the_sound_at_2x_lasts_half_as_long_in_every_channel() {
+        let track = sound_decoder(Path::new(SAMPLE), Duration::ZERO).unwrap();
+        let channels = rodio::Source::channels(&track);
+        let plain = track.count();
+        let track = sound_decoder(Path::new(SAMPLE), Duration::ZERO).unwrap();
+        let stretched = Stretched::new(track, 2.0);
+        // The channels the track has, not a mono downmix.
+        assert_eq!(rodio::Source::channels(&stretched), channels);
+        let rate = rodio::Source::sample_rate(&stretched);
+        let total = rodio::Source::total_duration(&stretched).unwrap();
+        let samples = stretched.count();
+        assert_eq!(samples % usize::from(channels.get()), 0);
+        let frames = |samples: usize| samples / usize::from(channels.get());
+        // The clip's sound, in half the time, to the frame.
+        assert!(frames(samples).abs_diff(frames(plain).div_ceil(2)) <= 1);
+        let seconds = frames(samples) as f64 / f64::from(rate.get());
+        assert!(
+            (seconds - total.as_secs_f64()).abs() < 0.1,
+            "got {seconds} s"
+        );
+    }
+
+    #[test]
+    fn sped_up_sound_reports_the_video_time_it_reached() {
+        // A second heard at 2x from the 3 s mark is the 5 s mark, and the
+        // clock that follows it stays put.
+        let base = Duration::from_secs(3);
+        assert_eq!(
+            sound_position(base, Duration::from_secs(1), 2.0),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            sound_position(base, Duration::from_secs(2), 1.5),
+            Duration::from_secs(6)
+        );
+        let start = Instant::now();
+        let mut clock = Clock::default();
+        clock.seek(base, start);
+        clock.resume(start);
+        clock.set_speed(2.0, start);
+        let later = start + Duration::from_secs(1);
+        clock.follow(sound_position(base, Duration::from_secs(1), 2.0), later);
+        assert_eq!(clock.position(later), Duration::from_secs(5));
+    }
+
+    #[test]
     fn clock_runs_pauses_and_seeks() {
         let start = Instant::now();
         let later = |ms| start + Duration::from_millis(ms);
@@ -1644,6 +1923,49 @@ mod tests {
         assert_eq!(upside_down.pixels, [white, black]);
         let back = convert(&planes, (2, 1), 3);
         assert_eq!(back.pixels, [white, black]);
+    }
+
+    #[test]
+    fn a_peer_orientation_turns_the_picture_upright() {
+        // The low two bits are the rotation; the keyframe flag rides in a higher bit.
+        assert_eq!(orientation_turns(0), 0);
+        assert_eq!(orientation_turns(1), 3);
+        assert_eq!(orientation_turns(2), 2);
+        assert_eq!(orientation_turns(3), 1);
+        assert_eq!(orientation_turns(0x08 | 1), 3);
+
+        // A four by two picture, dark on the left. A peer whose device orientation is one quarter
+        // turn counter-clockwise has sent it rotated, so it must be turned back the same amount:
+        // the picture comes out portrait, two wide by four tall, with the half that was on the
+        // right now on top.
+        let y = [16, 16, 235, 235, 16, 16, 235, 235];
+        let chroma = [128, 128];
+        let planes = Planes {
+            y: &y,
+            u: &chroma,
+            v: &chroma,
+            strides: (4, 2, 2),
+            size: (4, 2),
+        };
+        let black = egui::Color32::from_rgb(0, 0, 0);
+        let white = egui::Color32::from_rgb(255, 255, 255);
+        let upright = convert(&planes, (4, 2), orientation_turns(1));
+        assert_eq!(
+            upright.size,
+            [2, 4],
+            "the sides swap, so a portrait stays portrait"
+        );
+        assert_eq!(
+            upright.pixels,
+            [white, white, white, white, black, black, black, black]
+        );
+        // An upright frame is left alone, and a half turn swaps the halves without reshaping.
+        let alone = convert(&planes, (4, 2), orientation_turns(0));
+        assert_eq!(alone.size, [4, 2]);
+        assert_eq!(alone.pixels[..4], [black, black, white, white]);
+        let halves = convert(&planes, (4, 2), orientation_turns(2));
+        assert_eq!(halves.size, [4, 2]);
+        assert_eq!(halves.pixels[..4], [white, white, black, black]);
     }
 
     #[test]

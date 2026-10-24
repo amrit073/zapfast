@@ -33,16 +33,23 @@ pub enum ThemeChoice {
     Dark,
     Light,
     System,
+    /// macOS's greys, light or dark as the system is, with bubbles shaped as
+    /// Messages draws them.
+    Messages,
 }
 
 impl ThemeChoice {
-    pub const ALL: [ThemeChoice; 3] = [Self::System, Self::Light, Self::Dark];
+    /// The choices Settings offers, on every platform. Messages shows the
+    /// desktop through its window where the platform can, and is opaque in
+    /// its own colours elsewhere (see [`crate::backdrop`]).
+    pub const ALL: &[ThemeChoice] = &[Self::System, Self::Light, Self::Dark, Self::Messages];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Dark => "Dark",
             Self::Light => "Light",
             Self::System => "Follow system",
+            Self::Messages => "Messages",
         }
     }
 }
@@ -344,6 +351,40 @@ impl AutoLock {
     }
 }
 
+/// Which chats show one notification, then stay quiet for ten minutes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationLimit {
+    #[default]
+    Off,
+    Direct,
+    Group,
+    Both,
+}
+
+impl NotificationLimit {
+    pub const ALL: [NotificationLimit; 4] = [Self::Off, Self::Direct, Self::Group, Self::Both];
+
+    /// Whether a chat of this kind is limited.
+    pub fn applies(self, is_group: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Direct => !is_group,
+            Self::Group => is_group,
+            Self::Both => true,
+        }
+    }
+
+    pub fn label(self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Off => crate::i18n::gettext(locale, "Off"),
+            Self::Direct => crate::i18n::gettext(locale, "Direct messages"),
+            Self::Group => crate::i18n::gettext(locale, "Groups"),
+            Self::Both => crate::i18n::gettext(locale, "Direct messages and groups"),
+        }
+    }
+}
+
 /// The sound a new-message notification makes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -370,8 +411,18 @@ pub struct Settings {
     #[serde(default)]
     pub version: u32,
     pub theme: ThemeChoice,
+    /// Whether a `"system"` theme is really Messages. The file says
+    /// `"system"` for Messages, which releases before it read as Follow
+    /// system instead of rejecting the whole file; this marks the rest.
+    #[serde(skip_serializing)]
+    pub(crate) messages_theme: bool,
     /// The interface's typeface.
     pub font: FontChoice,
+    /// Windows and Linux: draw ZapFast's own title bar and window buttons
+    /// instead of the desktop's. Off by default: on some Intel graphics
+    /// drivers a frameless window shows a black band at the top and its
+    /// clicks land below where they are drawn (Spotifast #348, #554).
+    pub custom_titlebar: bool,
     /// Interface language. `None` follows the operating system's locale.
     pub interface_language: Option<crate::i18n::Locale>,
     /// Filename of the selected local JSON palette.
@@ -393,6 +444,8 @@ pub struct Settings {
     pub sidebar_width: f32,
     /// Width of the search pane beside the open chat.
     pub search_pane_width: f32,
+    /// Width of the info panel beside the open chat.
+    pub info_pane_width: f32,
     /// Whether Enter sends. Off, Enter adds a line and Ctrl+Enter (Cmd+Enter
     /// on macOS) sends.
     pub enter_sends: bool,
@@ -427,6 +480,9 @@ pub struct Settings {
     pub keep_running_in_background: bool,
     /// Desktop notifications while away from the chat.
     pub notifications: bool,
+    /// Notifications name the chat and sender and show the message. Off,
+    /// every one says only "New message", as behind the app lock.
+    pub notification_content: bool,
     /// Sound for new messages, in one-to-one chats and groups alike.
     pub message_sound: NotificationSound,
     /// Sound for group messages that mention us or reply to one of ours, as
@@ -497,14 +553,17 @@ impl Default for Settings {
         Self {
             version: SETTINGS_VERSION,
             theme: ThemeChoice::Dark,
+            messages_theme: false,
             font: FontChoice::System,
+            custom_titlebar: false,
             interface_language: None,
             custom_theme: None,
             custom_theme_cache: None,
             system_theme_cache: None,
             zoom: 1.0,
-            sidebar_width: 320.0,
+            sidebar_width: 300.0,
             search_pane_width: 380.0,
+            info_pane_width: 380.0,
             enter_sends: true,
             send_read_receipts: true,
             send_typing: true,
@@ -520,6 +579,7 @@ impl Default for Settings {
             giphy_key: String::new(),
             keep_running_in_background: true,
             notifications: true,
+            notification_content: true,
             message_sound: NotificationSound::Receive,
             mention_sound: NotificationSound::Alert,
             group_sounds: true,
@@ -646,15 +706,42 @@ impl Settings {
     }
 
     /// Replaces the settings file whole, never leaving it half written.
+    /// Waits for the disk, so never on the thread that draws the window:
+    /// there, [`Self::save_to`].
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let contents = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fastframe_file::write(path, contents)
+        fastframe_file::write(path, self.contents()?)
+    }
+
+    /// Hands the settings file to `files`, which replaces it off this thread.
+    pub fn save_to(&self, files: &fastframe_file::Writer, path: &Path) -> std::io::Result<()> {
+        files.write(path, self.contents()?, fastframe_file::Access::Default);
+        Ok(())
+    }
+
+    fn contents(&self) -> std::io::Result<String> {
+        serde_json::to_string_pretty(&self.to_file()?).map_err(std::io::Error::other)
+    }
+
+    /// The settings as the file stores them: Messages is written as Follow
+    /// system plus a mark, so older releases still read the file.
+    fn to_file(&self) -> std::io::Result<serde_json::Value> {
+        let mut value = serde_json::to_value(self).map_err(std::io::Error::other)?;
+        if self.theme == ThemeChoice::Messages
+            && let Some(fields) = value.as_object_mut()
+        {
+            fields.insert("theme".into(), serde_json::to_value(ThemeChoice::System)?);
+            fields.insert("messages_theme".into(), true.into());
+        }
+        Ok(value)
     }
 
     /// Brings a file written before [`SETTINGS_VERSION`] up to date. Each
     /// step runs once: the next save records the version, so a colour chosen
     /// again afterwards is kept.
     fn migrate(&mut self) {
+        if std::mem::take(&mut self.messages_theme) && self.theme == ThemeChoice::System {
+            self.theme = ThemeChoice::Messages;
+        }
         if self.version < 1 {
             // Old files store every field, so a default colour cannot be told
             // from a chosen one; the old defaults move to the new one.
@@ -739,9 +826,21 @@ pub struct AccountSettings {
     pub auto_download: bool,
     pub last_chat: Option<String>,
     pub notifications: bool,
+    /// Which chats notify once, then stay quiet for ten minutes.
+    pub limit_notifications: NotificationLimit,
     pub save_contacts_to_phone: bool,
     /// This account's copy of the chosen chat wallpaper image.
     pub wallpaper_image: Option<std::path::PathBuf>,
+    /// Whether this account's phone is asked for older history in the
+    /// background. Off by default: it asks the phone for history nobody
+    /// scrolled to, so an account that has never turned it on does not.
+    pub history_prefetch: bool,
+    /// The chip or label the chat list last showed, as
+    /// [`crate::model::ListFilter::key`] writes it; `None` shows every chat.
+    pub list_filter: Option<String>,
+    /// The chip the Calls page last showed, as
+    /// [`crate::model::CallFilter::key`] writes it; `None` shows every call.
+    pub call_filter: Option<String>,
 }
 
 impl Default for AccountSettings {
@@ -752,8 +851,12 @@ impl Default for AccountSettings {
             auto_download: true,
             last_chat: None,
             notifications: true,
+            limit_notifications: NotificationLimit::Off,
             save_contacts_to_phone: true,
             wallpaper_image: None,
+            history_prefetch: false,
+            list_filter: None,
+            call_filter: None,
         }
     }
 }
@@ -766,8 +869,12 @@ impl AccountSettings {
             auto_download: settings.auto_download,
             last_chat: settings.last_chat.clone(),
             notifications: settings.notifications,
+            limit_notifications: NotificationLimit::Off,
             save_contacts_to_phone: settings.save_contacts_to_phone,
             wallpaper_image: settings.wallpaper_image.clone(),
+            history_prefetch: false,
+            list_filter: None,
+            call_filter: None,
         }
     }
 
@@ -781,9 +888,18 @@ impl AccountSettings {
         }
     }
 
+    /// Replaces the file whole, waiting for the disk: only before the
+    /// window's thread is running (the first account's migration).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let contents = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         fastframe_file::write(path, contents)
+    }
+
+    /// Hands the file to `files`, which replaces it off this thread.
+    pub fn save_to(&self, files: &fastframe_file::Writer, path: &Path) -> std::io::Result<()> {
+        let contents = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        files.write(path, contents, fastframe_file::Access::Default);
+        Ok(())
     }
 }
 
@@ -835,9 +951,11 @@ impl AccountRoster {
         self.next_id = self.next_id.max(highest + 1).max(2);
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+    /// Hands the file to `files`, which replaces it off this thread.
+    pub fn save_to(&self, files: &fastframe_file::Writer, path: &Path) -> std::io::Result<()> {
         let contents = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        fastframe_file::write(path, contents)
+        files.write(path, contents, fastframe_file::Access::Default);
+        Ok(())
     }
 
     pub fn allocate(&mut self) -> crate::model::AccountId {
@@ -882,6 +1000,44 @@ mod tests {
         assert_eq!(chosen.font, FontChoice::Inter);
         let saved = serde_json::to_value(&chosen).unwrap();
         assert_eq!(saved["font"], "inter");
+    }
+
+    /// The Messages theme is saved by name, and palettes cached before
+    /// bubble styles existed keep WhatsApp's bubbles.
+    #[test]
+    fn messages_theme_round_trips_and_old_palettes_keep_whatsapp_bubbles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let settings = Settings {
+            theme: ThemeChoice::Messages,
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        // Releases before Messages read the file, and see Follow system.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["theme"], "system");
+        assert_eq!(written["messages_theme"], true);
+        assert_eq!(Settings::load(&path).theme, ThemeChoice::Messages);
+        // Follow system stays Follow system, without the mark.
+        let system = Settings {
+            theme: ThemeChoice::System,
+            ..Settings::default()
+        };
+        system.save(&path).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("messages_theme")
+        );
+        assert_eq!(Settings::load(&path).theme, ThemeChoice::System);
+        // Files written by development builds before this still load.
+        let parsed: Settings = serde_json::from_str(r#"{"theme":"messages"}"#).expect("parses");
+        assert_eq!(parsed.theme, ThemeChoice::Messages);
+        let mut cached = serde_json::to_value(crate::theme::Palette::dark()).unwrap();
+        cached.as_object_mut().unwrap().remove("bubbles");
+        let cached: crate::theme::Palette = serde_json::from_value(cached).unwrap();
+        assert_eq!(cached.bubbles, crate::theme::BubbleStyle::WhatsApp);
     }
 
     #[test]
@@ -982,7 +1138,7 @@ mod tests {
         let (settings, stored) = load_from(
             r#"{"enter_sends":false,"label_chips":true,"show_sender_pictures":true,
                 "names_from_contacts":false,"collapse_chat_list":false,
-                "save_contacts_to_phone":false}"#,
+                "save_contacts_to_phone":false,"keep_chat_list_position":true}"#,
         );
         assert!(!settings.enter_sends, "the rest of the file still loads");
         assert!(
@@ -996,6 +1152,7 @@ mod tests {
             "collapse_chat_list",
             "pause_media_while_recording",
             "pause_media_while_playing",
+            "keep_chat_list_position",
         ] {
             assert!(stored.get(key).is_none(), "{key} is dropped on save");
         }
@@ -1127,6 +1284,36 @@ mod tests {
             egui::Color32::from_rgb(15, 36, 36)
         );
         assert_eq!(chosen.wallpaper_background(&light), light.chat);
+    }
+
+    /// Saves handed to the file writer write the same files `save` does,
+    /// once the writer is flushed.
+    #[test]
+    fn saves_through_the_writer_land_after_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = fastframe_file::Writer::new();
+        let settings = Settings {
+            theme: ThemeChoice::Messages,
+            check_for_updates: false,
+            ..Settings::default()
+        };
+        let settings_path = dir.path().join("settings.json");
+        settings.save_to(&files, &settings_path).unwrap();
+        let account = AccountSettings {
+            history_prefetch: true,
+            ..AccountSettings::default()
+        };
+        let account_path = dir.path().join("accounts").join("2").join("settings.json");
+        account.save_to(&files, &account_path).unwrap();
+        let mut roster = AccountRoster::default();
+        roster.allocate();
+        let roster_path = dir.path().join("accounts.json");
+        roster.save_to(&files, &roster_path).unwrap();
+
+        assert!(files.flush(std::time::Duration::from_secs(10)));
+        assert_eq!(Settings::load(&settings_path), settings);
+        assert_eq!(AccountSettings::load(&account_path), account);
+        assert_eq!(AccountRoster::load(&roster_path).unwrap(), roster);
     }
 
     #[test]
@@ -1261,5 +1448,31 @@ mod giphy_tests {
             .filter(|key| !key.is_empty())
             .map(str::to_owned);
         assert_eq!(settings.effective_giphy_key(), expected);
+    }
+
+    #[test]
+    fn notification_limits_are_off_unless_saved() {
+        let settings: AccountSettings = serde_json::from_str(r#"{"notifications":true}"#).unwrap();
+        assert_eq!(settings.limit_notifications, NotificationLimit::Off);
+        let saved = AccountSettings {
+            limit_notifications: NotificationLimit::Group,
+            ..AccountSettings::default()
+        };
+        let again: AccountSettings =
+            serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(again, saved);
+    }
+
+    #[test]
+    fn a_notification_limit_names_the_chats_it_applies_to() {
+        for (limit, direct, group) in [
+            (NotificationLimit::Off, false, false),
+            (NotificationLimit::Direct, true, false),
+            (NotificationLimit::Group, false, true),
+            (NotificationLimit::Both, true, true),
+        ] {
+            assert_eq!(limit.applies(false), direct, "{limit:?} for direct chats");
+            assert_eq!(limit.applies(true), group, "{limit:?} for groups");
+        }
     }
 }

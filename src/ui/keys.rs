@@ -3,15 +3,21 @@
 use egui::{Key, Modifiers};
 
 use crate::app::App;
-use crate::model::{Action, Chat, Dialog, Page, Scroll};
+use crate::model::{Action, Chat, Dialog, InfoView, Page, Scroll};
 
+/// Routes keyboard commands to actions, respecting overlays and text focus.
 pub fn handle(app: &mut App, ctx: &egui::Context) {
+    if app.picture_edit.is_some() {
+        editor_keys(app, ctx);
+        return;
+    }
     if app.image_preview.is_some() {
+        video_keys(app, ctx);
         preview_keys(app, ctx);
         return;
     }
-    if app.video_expanded {
-        video_keys(app, ctx);
+    if app.sticker_view.is_some() {
+        sticker_view_keys(app, ctx);
         return;
     }
     let editing_text = ctx.text_edit_focused();
@@ -58,7 +64,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
                 Action::ShowDialog(Dialog::Shortcuts),
             );
         }
-        if app.page == Page::Chats
+        if app.chat_view()
             && app.open_chat.is_some()
             && app.dialog.is_none()
             && !app.show_update
@@ -85,16 +91,51 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         key(Modifiers::COMMAND, Key::Minus, Action::ZoomBy(-0.1));
         key(Modifiers::COMMAND, Key::Num0, Action::ResetZoom);
         key(Modifiers::COMMAND, Key::End, Action::ScrollToBottom);
+        // The rail's Chats and Calls, by the digit's place on the keyboard:
+        // with Shift held, layouts report the digits as their symbols.
+        // Ctrl+1..9 without Shift open chats by their place in the list.
+        if app.is_linked() {
+            match take_destination(input) {
+                Some(1) => actions.extend(super::rail::Destination::Chats.actions(app)),
+                Some(2) => actions.extend(super::rail::Destination::Calls.actions(app)),
+                _ => {}
+            }
+        }
     });
     // Escape cancels the topmost state. Menus handle Escape themselves.
     let menu_open = egui::Popup::is_any_open(ctx);
     let search_focused = ctx.memory(|memory| memory.has_focus(egui::Id::new("chat-search")));
     let composer_focused = ctx.memory(|memory| memory.has_focus(egui::Id::new("composer-text")));
+    if app.chat_view()
+        && app.selection.as_ref().is_some_and(|(chat, selected)| {
+            app.open_chat.as_ref() == Some(chat) && !selected.is_empty()
+        })
+        && app.dialog.is_none()
+        && !app.show_update
+        && app.picker.is_none()
+        && app.reaction_target.is_none()
+        && app.recording.is_none()
+        && !app.chat_search_calendar
+        && !menu_open
+        // The selection bar replaces the composer. Its previous frame's
+        // focus must not swallow Copy before egui drops that hidden field.
+        && (!editing_text || composer_focused)
+        && ctx.input(|input| input.events.iter().any(is_copy_event))
+        && let Some(text) = super::conversation::selected_text(app)
+    {
+        // Native clipboard commands arrive as Event::Copy, including Copy
+        // from the macOS menu. Consume only when we have text to export;
+        // otherwise leave Copy available to egui's text-selection hook.
+        ctx.input_mut(|input| {
+            input.events.retain(|event| !is_copy_event(event));
+        });
+        actions.push(Action::CopyText(text));
+    }
     // PgUp/PgDn/Home/End scroll the open chat. PgUp/PgDn also work while the
     // composer has focus, since egui's TextEdit does not handle them itself;
     // Home/End keep moving the text cursor in a non-empty field, as ↑ keeps
     // its normal meaning outside an empty composer.
-    if app.page == Page::Chats
+    if app.chat_view()
         && app.open_chat.is_some()
         && app.dialog.is_none()
         && !app.show_update
@@ -125,9 +166,6 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     if escape {
         if app.show_update {
             actions.push(Action::CloseUpdate);
-        } else if app.dialog.is_some() && app.group_name_edit.is_some() {
-            // Cancels the group rename and keeps the dialog open.
-            actions.push(Action::CloseGroupName);
         } else if app.dialog.is_some() {
             actions.push(Action::CloseDialog);
         } else if app.recording.is_some() {
@@ -138,6 +176,8 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             // Taken here, the key never reaches the selection bar, and
             // would otherwise fall through to closing the chat.
             actions.push(Action::CancelSelection);
+        } else if app.show_starred {
+            actions.push(Action::ToggleStarred);
         } else if app.chat_search_visible() && app.chat_search_calendar {
             // The day filter first, then the pane it hangs from.
             app.chat_search_calendar = false;
@@ -153,11 +193,42 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             actions.push(Action::CancelEdit);
         } else if app.reply_to.is_some() {
             actions.push(Action::CancelReply);
+        } else if app.call_fullscreen {
+            // The window shrinks back first, and only then does the next Escape put the surface
+            // aside. Neither one ends the call; only the hang-up button does that.
+            actions.push(Action::ToggleCallFullscreen);
+        } else if app.call_surface_open() {
+            // The same move the surface's own button makes: the call keeps running, and the bar at
+            // the bottom of the chat offers the way back.
+            actions.push(Action::LeaveCallSurface);
+        } else if app.info_visible() && app.group_name_edit.is_some() {
+            // Cancels the group rename and keeps the panel open.
+            actions.push(Action::CloseGroupName);
+        } else if app.info_visible() && app.contact_edit.is_some() {
+            actions.push(Action::CloseContactEdit);
+        } else if app.info_visible() {
+            // After what the composer was in the middle of: the media view
+            // goes back to the overview, and the overview closes the panel.
+            let media = matches!(
+                app.info.as_ref().map(|info| info.view),
+                Some(InfoView::Media(_))
+            );
+            actions.push(if media {
+                Action::ShowInfo(InfoView::Overview)
+            } else {
+                Action::CloseInfo
+            });
         } else if app.page == Page::Wallpaper {
             actions.push(Action::Open(Page::Settings));
         } else if app.page == Page::Settings && !app.settings_search.is_empty() {
             actions.push(Action::SearchSettings(String::new()));
-        } else if app.page == Page::Settings {
+        } else if app.page == Page::Calls && app.new_call {
+            actions.push(Action::ShowNewCall(false));
+        } else if app.page == Page::Calls && super::narrow(ctx) && app.call_picked() {
+            // A narrow window shows the picked call's chat over the history:
+            // Escape goes back to it, as the chat's Back does.
+            actions.push(Action::CloseChat);
+        } else if app.page == Page::Settings || app.page == Page::Calls {
             actions.push(Action::Open(Page::Chats));
         } else if search_focused || !app.search.is_empty() {
             if !app.search.is_empty() {
@@ -243,7 +314,7 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     // else: it navigates open overlays and moves the cursor in a non-empty
     // field.
     let edit_previous = composer_focused
-        && app.page == Page::Chats
+        && app.chat_view()
         && app.open_chat.is_some()
         && app
             .open_chat
@@ -264,6 +335,15 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         actions.push(Action::Edit(id));
     }
     app.actions.extend(actions);
+}
+
+/// Recognizes native Copy and plain Command/Ctrl+C presses.
+fn is_copy_event(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Copy)
+        || matches!(event, egui::Event::Key {
+            key: Key::C, pressed: true, modifiers, ..
+        } if (modifiers.command || modifiers.ctrl)
+            && !modifiers.alt && !modifiers.shift)
 }
 
 /// Takes an exact Command/Ctrl+1..9 press, leaving modified number keys alone.
@@ -299,6 +379,34 @@ fn take_chat_number(input: &mut egui::InputState) -> Option<usize> {
     number
 }
 
+/// Takes Ctrl+Shift+1 or Ctrl+Shift+2 (Cmd on macOS), the rail's Chats and
+/// Calls, and says which. It goes by the key's place on the keyboard: with
+/// Shift held, each layout reports the digit as a symbol of its own.
+fn take_destination(input: &mut egui::InputState) -> Option<u8> {
+    let mut destination = None;
+    input.events.retain(|event| {
+        if destination.is_none()
+            && let egui::Event::Key {
+                key,
+                physical_key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            && modifiers.matches_exact(Modifiers::COMMAND | Modifiers::SHIFT)
+        {
+            destination = match physical_key.unwrap_or(*key) {
+                Key::Num1 => Some(1),
+                Key::Num2 => Some(2),
+                _ => None,
+            };
+            return destination.is_none();
+        }
+        true
+    });
+    destination
+}
+
 /// Removes this frame's first plain (unmodified) press of `key`, if any, and
 /// reports whether one was found. `consume_key` is unsuitable here: it also
 /// matches the key with Shift or Alt held, and a plain binding must leave
@@ -325,8 +433,8 @@ pub(super) fn take_plain(input: &mut egui::InputState, key: Key) -> bool {
 }
 
 /// Handles keys while the image preview is open. No chat shortcut runs, and
-/// typing and clipboard input are swallowed; Tab, Enter, Space and the arrows
-/// stay for the preview's own controls.
+/// typing and clipboard input are swallowed; Left/Right browse photos, while
+/// Tab, Enter, Space and Up/Down stay for the preview's own controls.
 fn preview_keys(app: &mut App, ctx: &egui::Context) {
     let mut actions = Vec::new();
     ctx.input_mut(|input| {
@@ -335,8 +443,15 @@ fn preview_keys(app: &mut App, ctx: &egui::Context) {
         }
         let copy_shortcut = input.consume_key(Modifiers::COMMAND, Key::C)
             || input.consume_key(Modifiers::CTRL, Key::C);
-        if copy_shortcut && let Some(preview) = &app.image_preview {
-            actions.push(Action::CopyImage(preview.path().to_owned()));
+        // The header leaves the copy action out while a clip is on screen, so
+        // the shortcut does the same: copying a clip would decode a video as an
+        // image and fail.
+        if copy_shortcut
+            && let Some(preview) = &app.image_preview
+            && let Some(path) = preview.path()
+            && !preview.shows_video(&app.viewer_media)
+        {
+            actions.push(Action::CopyImage(path.to_owned()));
         }
         let mut event_actions = Vec::new();
         for event in &input.events {
@@ -350,6 +465,22 @@ fn preview_keys(app: &mut App, ctx: &egui::Context) {
                 event_actions.extend(crate::image_preview::preview_action(*key, *modifiers));
             }
         }
+        // A clip has no zoom, as its header has no zoom controls.
+        let clip = app
+            .image_preview
+            .as_ref()
+            .is_some_and(|preview| preview.shows_video(&app.viewer_media));
+        if clip {
+            event_actions.retain(|action| {
+                !matches!(
+                    action,
+                    Action::ZoomImageIn
+                        | Action::ZoomImageOut
+                        | Action::FitImage
+                        | Action::ImageActualSize
+                )
+            });
+        }
         actions.extend(event_actions);
         input
             .events
@@ -358,9 +489,25 @@ fn preview_keys(app: &mut App, ctx: &egui::Context) {
     app.actions.extend(actions);
 }
 
-/// Handles keys while a video covers the window: Escape puts it back, Space
-/// plays or pauses, M mutes, and the arrows jump five seconds. No chat
-/// shortcut runs and nothing is typed into the composer under it.
+/// Handles keys while the cropper covers the window: Escape leaves the
+/// staged picture alone, Enter keeps the crop.
+fn editor_keys(app: &mut App, ctx: &egui::Context) {
+    let mut actions = Vec::new();
+    ctx.input_mut(|input| {
+        if input.consume_key(Modifiers::NONE, Key::Escape) {
+            actions.push(Action::CancelPictureEdit);
+        }
+        if input.consume_key(Modifiers::NONE, Key::Enter) {
+            actions.push(Action::ApplyPictureEdit);
+        }
+    });
+    app.actions.extend(actions);
+}
+
+/// Handles a playing clip's keys while the viewer shows it: Space plays or
+/// pauses, M mutes, S changes the speed, and the arrows jump five seconds, as
+/// they step through the album only while a picture is on the stage. Escape
+/// closes the viewer, which puts a video back in its message.
 fn video_keys(app: &mut App, ctx: &egui::Context) {
     let Some((message, path)) = app
         .video
@@ -370,6 +517,15 @@ fn video_keys(app: &mut App, ctx: &egui::Context) {
     else {
         return;
     };
+    // Only the clip on the viewer: anything else was stopped as it opened.
+    let on_screen = app.image_preview.as_ref().is_some_and(|preview| {
+        preview.message() == message
+            && preview.shows_video(&app.viewer_media)
+            && preview.clip_path() == Some(path.as_path())
+    });
+    if !on_screen {
+        return;
+    }
     let status = app.video.status(&message);
     let jump = |seconds: f32| {
         let status = status.as_ref()?;
@@ -381,9 +537,6 @@ fn video_keys(app: &mut App, ctx: &egui::Context) {
     };
     let mut actions = Vec::new();
     ctx.input_mut(|input| {
-        if input.consume_key(Modifiers::NONE, Key::Escape) {
-            actions.push(Action::CollapseVideo);
-        }
         if input.consume_key(Modifiers::NONE, Key::Space) {
             actions.push(Action::PlayVideo {
                 message: message.clone(),
@@ -393,20 +546,32 @@ fn video_keys(app: &mut App, ctx: &egui::Context) {
         if input.consume_key(Modifiers::NONE, Key::M) {
             actions.push(Action::ToggleVideoSound);
         }
+        if input.consume_key(Modifiers::NONE, Key::S) {
+            actions.push(Action::CycleVideoSpeed);
+        }
         if input.consume_key(Modifiers::NONE, Key::ArrowLeft) {
             actions.extend(jump(-5.0));
         }
         if input.consume_key(Modifiers::NONE, Key::ArrowRight) {
             actions.extend(jump(5.0));
         }
-        input.events.retain(|event| {
-            !matches!(
-                event,
-                egui::Event::Key { .. } | egui::Event::Text(_) | egui::Event::Paste(_)
-            )
-        });
     });
     app.actions.extend(actions);
+}
+
+/// Handles keys while a sticker is shown large: Escape closes it, and no
+/// chat shortcut or typing reaches the chat behind it.
+fn sticker_view_keys(app: &mut App, ctx: &egui::Context) {
+    let close = ctx.input_mut(|input| {
+        let close = input.consume_key(Modifiers::NONE, Key::Escape);
+        input
+            .events
+            .retain(|event| !crate::image_preview::consumes_key(event));
+        close
+    });
+    if close {
+        app.actions.push(Action::CloseStickerPreview);
+    }
 }
 
 /// Ctrl+F searches the open chat, as in WhatsApp, the chat list when no
@@ -414,7 +579,7 @@ fn video_keys(app: &mut App, ctx: &egui::Context) {
 fn find_action(app: &App) -> Action {
     match app.page {
         Page::Settings => Action::FocusSettingsSearch,
-        Page::Chats if app.open_chat.is_some() => Action::OpenChatSearch,
+        Page::Chats | Page::Calls if app.open_chat.is_some() => Action::OpenChatSearch,
         _ => Action::FocusSearch,
     }
 }
@@ -422,7 +587,7 @@ fn find_action(app: &App) -> Action {
 /// Ctrl+E archives the open chat, or unarchives an archived one, as in
 /// WhatsApp. Archiving closes the chat, as the chat menus do.
 fn archive_action(app: &App) -> Option<Action> {
-    if app.page != Page::Chats
+    if !app.chat_view()
         || app.dialog.is_some()
         || app.show_update
         || app.picker.is_some()
@@ -465,11 +630,13 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Alt+↑ / Alt+↓", "Previous / next chat"),
     ("Ctrl+Shift+[ / ]", "Previous / next chat, as in WhatsApp"),
     ("Ctrl+1..9", "Open a chat by its position in the chat list"),
+    ("Ctrl+Shift+1", "Chats"),
+    ("Ctrl+Shift+2", "Calls"),
     ("↑", "Edit the previous message (when the input is empty)"),
     ("Enter", "Send (Shift+Enter for a new line)"),
     (
         "Escape",
-        "Dismiss the current action, return from search, or close the chat",
+        "Dismiss the current action, return from search, Calls or Starred, or close the chat",
     ),
     ("Ctrl+N", "New chat or message yourself"),
     ("Ctrl+E", "Archive or unarchive the open chat"),
@@ -478,6 +645,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
         "Ctrl+V",
         "Paste text, or stage a picture from the clipboard",
     ),
+    ("Ctrl+C", "Copy the selected messages"),
     ("Ctrl+B", "Collapse or expand the chat list"),
     ("Ctrl+End", "Jump to the newest message"),
     ("PgUp / PgDn", "Scroll the open chat by a page"),
@@ -488,6 +656,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+,", "Settings"),
     ("Ctrl++ / Ctrl+-", "Zoom in / out"),
     ("Ctrl+0", "Reset zoom"),
+    ("← / →", "Previous / next item in the media viewer"),
     ("? / Ctrl+/", "Keyboard shortcuts (? when not typing)"),
     ("Ctrl+Shift+L", "Lock ZapFast (with an app lock password)"),
     ("Ctrl+W", "Close the window (ZapFast remains in the tray)"),
@@ -551,6 +720,158 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn escape_leaves_the_calls_page() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        app.page = Page::Calls;
+        escape(&mut app, &egui::Context::default());
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::Open(Page::Chats)]
+        ));
+    }
+
+    #[test]
+    fn escape_closes_the_new_call_list_then_returns_to_the_chats() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        app.page = Page::Calls;
+        app.new_call = true;
+        app.open_chat = Some("ada@s.whatsapp.net".into());
+        app.picked_call = Some(("ada@s.whatsapp.net".into(), "call-1".into()));
+        let ctx = egui::Context::default();
+        escape(&mut app, &ctx);
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::ShowNewCall(false)]
+        ));
+        app.actions.clear();
+        app.new_call = false;
+        // Beside the history, the picked chat stays open on the way out.
+        escape(&mut app, &ctx);
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::Open(Page::Chats)]
+        ));
+    }
+
+    /// Escape leaves the call screen rather than the call.
+    ///
+    /// The window shrinks back first and only the next Escape puts the surface aside, and neither
+    /// one hangs up: a call the reader stepped away from is still running behind the bar. This is
+    /// the rule the whole call surface turns on, so it is checked through the real key handler
+    /// rather than only through the actions it pushes.
+    #[test]
+    fn escape_leaves_the_call_screen_without_ending_the_call() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        app.call = Some(crate::calls::CallUpdate {
+            generation: 1,
+            chat: "1@s.whatsapp.net".to_owned(),
+            direction: crate::model::CallDirection::Outgoing,
+            video: false,
+            phase: crate::calls::CallPhase::Active,
+            started: Some(std::time::Instant::now()),
+            muted: false,
+            camera_on: false,
+            remote_video: false,
+            video_requested: false,
+            outcome: None,
+            peer_audio: None,
+            lost_devices: Vec::new(),
+            microphone: None,
+            speaker: None,
+            camera: None,
+            group: None,
+        });
+        app.call_fullscreen = true;
+        let ctx = egui::Context::default();
+        escape(&mut app, &ctx);
+        assert!(
+            matches!(app.actions.as_slice(), [Action::ToggleCallFullscreen]),
+            "the window shrinks back first: {:?}",
+            app.actions
+        );
+        app.actions.clear();
+        // The window is back at its normal size, which is what that action does, so the next
+        // Escape reaches the surface rather than the full-screen state.
+        app.call_fullscreen = false;
+        escape(&mut app, &ctx);
+        assert!(
+            matches!(app.actions.as_slice(), [Action::LeaveCallSurface]),
+            "and only then does the surface step aside: {:?}",
+            app.actions
+        );
+        assert!(
+            !app.actions
+                .iter()
+                .any(|action| matches!(action, Action::HangupCall)),
+            "neither Escape hangs up"
+        );
+        assert_eq!(
+            app.call.as_ref().map(|call| call.phase),
+            Some(crate::calls::CallPhase::Active),
+            "Escape never ends the call"
+        );
+    }
+
+    /// Copy is for a picture. The header leaves the action out while a clip is
+    /// on screen, and the shortcut follows the same rule rather than decoding a
+    /// video as an image and failing.
+    #[test]
+    fn ctrl_c_does_not_copy_a_clip_from_the_viewer() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        let ctx = egui::Context::default();
+        let copy = |app: &mut App, ctx: &egui::Context| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: Key::C,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::CTRL,
+                    }],
+                    ..Default::default()
+                },
+                |ui| handle(app, ui.ctx()),
+            );
+            output.textures_delta.clear();
+        };
+        let showing = |path: &str, message: &str| {
+            Some(crate::image_preview::PreviewState::new(
+                Some(std::path::PathBuf::from(path)),
+                "fixture".into(),
+                message.into(),
+            ))
+        };
+        app.image_preview = showing("/cache/photo.png", "m1");
+        copy(&mut app, &ctx);
+        assert!(matches!(app.actions.as_slice(), [Action::CopyImage(_)]));
+        app.actions.clear();
+        app.image_preview = showing("/cache/clip.mp4", "m2");
+        copy(&mut app, &ctx);
+        assert!(app.actions.is_empty(), "a clip is played, not copied");
+    }
+
     fn escape(app: &mut App, ctx: &egui::Context) {
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -594,6 +915,108 @@ mod tests {
             app.actions.as_slice(),
             [Action::Open(Page::Chats)]
         ));
+    }
+
+    #[test]
+    fn escape_returns_from_the_media_view_then_closes_the_info_panel() {
+        use crate::model::{InfoPanel, InfoView, MediaTab};
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        app.page = Page::Chats;
+        app.open_chat = Some("fixture".into());
+        app.info = Some(InfoPanel {
+            chat: "fixture".into(),
+            view: InfoView::Media(MediaTab::Links),
+        });
+        let ctx = egui::Context::default();
+        escape(&mut app, &ctx);
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::ShowInfo(InfoView::Overview)]
+        ));
+        app.actions.clear();
+        app.info.as_mut().unwrap().view = InfoView::Overview;
+        // A group rename in the panel is cancelled before the panel closes.
+        app.group_name_edit = Some("Rust".into());
+        escape(&mut app, &ctx);
+        assert!(matches!(app.actions.as_slice(), [Action::CloseGroupName]));
+        app.actions.clear();
+        app.group_name_edit = None;
+        escape(&mut app, &ctx);
+        assert!(matches!(app.actions.as_slice(), [Action::CloseInfo]));
+    }
+
+    /// What the composer is in the middle of goes first: a reply, an edit,
+    /// staged files and suggestions are cancelled before the panel closes,
+    /// and a focused composer with nothing to cancel still closes the panel
+    /// rather than the chat.
+    #[test]
+    fn escape_cancels_composer_state_before_closing_the_info_panel() {
+        use crate::model::{InfoPanel, InfoView};
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        app.page = Page::Chats;
+        app.open_chat = Some("fixture".into());
+        app.info = Some(InfoPanel {
+            chat: "fixture".into(),
+            view: InfoView::Overview,
+        });
+        let ctx = egui::Context::default();
+        app.reply_to = Some("reply".into());
+        escape(&mut app, &ctx);
+        assert!(matches!(app.actions.as_slice(), [Action::CancelReply]));
+        assert!(app.info.is_some(), "the panel stays");
+        app.actions.clear();
+        app.reply_to = None;
+        app.emoji_start = Some(0);
+        escape(&mut app, &ctx);
+        assert!(matches!(
+            app.actions.as_slice(),
+            [Action::CloseEmojiSuggestions]
+        ));
+        app.actions.clear();
+        app.emoji_start = None;
+        app.stage(crate::app::Pending::File("unsent.png".into()));
+        escape(&mut app, &ctx);
+        assert!(matches!(app.actions.as_slice(), [Action::ClearPending]));
+        app.actions.clear();
+        app.pending.clear();
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("composer-text")));
+        escape(&mut app, &ctx);
+        assert!(
+            matches!(app.actions.as_slice(), [Action::CloseInfo]),
+            "the panel, not the chat: {:?}",
+            app.actions
+        );
+    }
+
+    #[test]
+    fn escape_cancels_a_contact_rename_and_keeps_the_info_panel() {
+        use crate::model::{InfoPanel, InfoView};
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        app.page = Page::Chats;
+        app.open_chat = Some("fixture".into());
+        app.info = Some(InfoPanel {
+            chat: "fixture".into(),
+            view: InfoView::Overview,
+        });
+        app.contact_edit = Some(("Ada".into(), String::new()));
+        let ctx = egui::Context::default();
+        escape(&mut app, &ctx);
+        assert!(matches!(app.actions.as_slice(), [Action::CloseContactEdit]));
     }
 
     #[test]
@@ -674,8 +1097,7 @@ mod tests {
         app.show_update = true;
         app.page = Page::Settings;
         app.reply_to = Some("reply-fixture".into());
-        app.pending
-            .push(crate::app::Pending::File("unsent.png".into()));
+        app.stage(crate::app::Pending::File("unsent.png".into()));
         let ctx = egui::Context::default();
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -888,12 +1310,63 @@ mod tests {
             Modifiers::NONE,
             Modifiers::SHIFT,
             Modifiers::ALT,
-            Modifiers::COMMAND | Modifiers::SHIFT,
             Modifiers::COMMAND | Modifiers::ALT,
         ] {
             assert!(press(&mut app, &ctx, Key::Num1, modifiers));
             assert!(app.actions.is_empty());
         }
+    }
+
+    /// Ctrl+Shift+1 and Ctrl+Shift+2 (Cmd on macOS) lead to the rail's
+    /// Chats and Calls by where the digit sits, whatever symbol the layout
+    /// puts on it with Shift held; Ctrl+1 and Ctrl+2 still open chats.
+    #[test]
+    fn shifted_digits_lead_to_the_chats_and_the_calls() {
+        let (_root, mut app, ids) = app_with_chats(2);
+        app.link = crate::backend::LinkStatus::Connected;
+        let ctx = egui::Context::default();
+        let shifted = |app: &mut App, key: Key, physical: Key| {
+            app.actions.clear();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key,
+                        physical_key: Some(physical),
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Modifiers::COMMAND | Modifiers::SHIFT,
+                    }],
+                    ..Default::default()
+                },
+                |ui| handle(app, ui.ctx()),
+            );
+            output.textures_delta.clear();
+            std::mem::take(&mut app.actions)
+        };
+        // US layouts report Shift+2 as "@", which egui has no key for, and
+        // Shift+1 as "!".
+        assert_eq!(
+            shifted(&mut app, Key::Num2, Key::Num2),
+            [Action::Open(Page::Calls)]
+        );
+        app.page = Page::Calls;
+        assert!(
+            shifted(&mut app, Key::Num2, Key::Num2).is_empty(),
+            "Calls is not a toggle"
+        );
+        assert_eq!(
+            shifted(&mut app, Key::Exclamationmark, Key::Num1),
+            [Action::Open(Page::Chats)]
+        );
+        app.page = Page::Chats;
+        app.show_starred = true;
+        assert_eq!(
+            shifted(&mut app, Key::Exclamationmark, Key::Num1),
+            [Action::ToggleStarred]
+        );
+        app.show_starred = false;
+        assert!(!press(&mut app, &ctx, Key::Num2, Modifiers::COMMAND));
+        assert!(app.actions.contains(&Action::OpenChat(ids[1].clone())));
     }
 
     #[test]

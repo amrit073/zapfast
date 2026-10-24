@@ -19,7 +19,7 @@ use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust::store::commands::DeviceCommand;
 
 async fn store(directory: &tempfile::TempDir) -> SqliteStore {
-    SqliteStore::new(directory.path().join("session.db").to_str().unwrap())
+    SqliteStore::open(directory.path().join("session.db").to_str().unwrap())
         .await
         .expect("an in-file store builds")
 }

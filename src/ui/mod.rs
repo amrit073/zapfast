@@ -1,23 +1,29 @@
 //! Window layout: panels, overlays, keyboard shortcuts.
 
 pub mod accounts;
+pub mod call;
 pub mod calls;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
 pub(crate) mod focus;
+mod glass;
+pub mod image_editor;
 pub mod image_preview;
+pub mod info;
 pub mod keys;
 pub mod labels;
+pub mod locations;
 pub mod lock;
 pub mod login;
 pub mod message_info;
+pub mod new_group;
 pub mod pane;
 pub mod picker;
 pub mod polls;
+pub mod rail;
 pub mod settings;
 pub mod update;
-pub mod video_preview;
 pub mod widgets;
 
 use egui::{Align2, CornerRadius, Frame, Margin, Stroke, vec2};
@@ -31,37 +37,44 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let ctx = ui.ctx().clone();
     let ctx = &ctx;
     track_keyboard_focus(ctx);
+    info::release_thumbnails(app, ctx);
     // Locked, nothing else is drawn: no chat list, no messages, no dialogs,
     // no toasts, and no shortcut reaches them.
     if app.app_lock.is_locked() {
         titlebar_strip(app, ui);
         lock::show(app, ui);
         focus_ring(app, ctx);
+        announce(app, ctx);
+        window_chrome(app, ui);
         return;
     }
     keys::handle(app, ctx);
     history_buttons(app, ctx);
     let main_navigation = app.is_linked()
-        && app.page == Page::Chats
+        && app.chat_view()
         && app.dialog.is_none()
         && !app.show_update
         && app.picker.is_none()
         && app.reaction_target.is_none()
         && app.recording.is_none()
         && app.image_preview.is_none()
-        && !app.video_expanded
+        && app.picture_edit.is_none()
+        && app.sticker_view.is_none()
         && app.emoji_start.is_none()
         && app.mention_start.is_none()
         // Selection keeps egui's order so Tab can reach message checkboxes.
         && app.selection.is_none()
         // The day filter keeps egui's own order among its days.
         && !app.chat_search_calendar
+        // The call screen covers the chats.
+        && (app.call.is_none() || app.call_surface_hidden)
+        // A name typed in the info panel keeps Tab between its fields.
+        && !(app.info_visible() && (app.contact_edit.is_some() || app.group_name_edit.is_some()))
         && !egui::Popup::is_any_open(ctx);
     focus::begin(ctx, main_navigation);
     // The open chat's composer records its rect again below, if there is one.
     ctx.data_mut(|data| data.remove::<egui::Rect>(composer_rect_id()));
     titlebar_strip(app, ui);
-    calls::show(app, ui);
     if !app.is_linked() {
         login::show(app, ui);
         accounts::corner(app, ctx);
@@ -69,20 +82,25 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         update::show(app, ctx);
         toasts(app, ctx);
         focus_ring(app, ctx);
+        announce(app, ctx);
+        window_chrome(app, ui);
         return;
     }
-    let macos = theme::macos_chrome(ctx);
-    if !macos {
+    // Where the headers share the top edge with the window's buttons, the
+    // banner goes under the open chat's header instead.
+    if !theme::chrome_in_headers(ctx) {
         banner(app, ui);
     }
     let narrow = narrow(ctx);
-    let list_only = narrow && app.page == Page::Chats && app.current_chat().is_none();
+    let list_only = narrow && list_pane_only(app);
     let view = narrow.then_some(if list_only {
         NarrowView::List
     } else {
         NarrowView::Detail
     });
     let slide = narrow_slide(ctx, view);
+    // A call the reader stepped away from keeps a strip along the bottom.
+    call::strip(app, ui);
     match slide {
         Some(progress) => slide_in(app, ui, list_only, progress),
         None => main_view(app, ui, list_only),
@@ -93,10 +111,31 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     picker::show(app, ctx);
     dialogs::show(app, ctx);
     image_preview::show(app, ctx);
-    video_preview::show(app, ctx);
+    image_preview::show_sticker(app, ctx);
+    call::show(app, ctx);
+    image_editor::show(app, ctx);
     drop_target(app, ctx);
     toasts(app, ctx);
     focus_ring(app, ctx);
+    announce(app, ctx);
+    window_chrome(app, ui);
+}
+
+/// Whether a narrow window shows the list pane: the chat list with no chat
+/// open, or the Calls tab's history with no call picked from it. Its header's
+/// buttons, its rows and the rail beside it lead on to the rest.
+fn list_pane_only(app: &App) -> bool {
+    match app.page {
+        Page::Chats => app.current_chat().is_none(),
+        Page::Calls => app.current_chat().is_none() || !app.call_picked(),
+        Page::Settings | Page::Wallpaper => false,
+    }
+}
+
+/// Emits the screen reader announcement nodes; private ones stay silent
+/// while the app is locked.
+fn announce(app: &mut App, ctx: &egui::Context) {
+    app.announcer.show(ctx, !app.app_lock.is_locked());
 }
 
 /// The chat list, or the open chat or page with the list beside it unless
@@ -107,23 +146,50 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
         return;
     }
     // A narrow window gives the open chat or page all of its width; the
-    // conversation header's Back returns to the list.
-    if !narrow(ui.ctx()) {
-        match app.sidebar_mode() {
-            SidebarDisplayMode::Expanded => chats::show(app, ui),
-            SidebarDisplayMode::CollapsedIconsOnly => chats::compact_show(app, ui),
+    // conversation header's Back returns to the list, and the rail beside
+    // it. The info panel takes a column of its own, and when the list leaves
+    // too little room for it and the conversation, the list and the rail
+    // step aside while the panel is open. The Calls tab's history needs the
+    // full list pane: only the chats collapse into the rail's avatars.
+    let full_list = app.sidebar_mode() == SidebarDisplayMode::Expanded || app.page == Page::Calls;
+    let mut list_width = chats::compact_width(ui.ctx());
+    if full_list {
+        list_width += app.settings.sidebar_width;
+    }
+    let crowded = app.info_visible()
+        && ui.available_width() - list_width < pane::INFO_MIN + pane::INFO_CONVERSATION_MIN;
+    if !narrow(ui.ctx()) && !crowded {
+        rail::show(app, ui, !full_list);
+        if full_list {
+            chats::show(app, ui);
         }
     }
     let search_overlay = pane::show(app, ui);
+    let info_overlay = info::show(app, ui);
     egui::CentralPanel::default()
         .frame(central_frame(app))
-        .show(ui, |ui| match app.page {
-            Page::Settings => settings::show(app, ui),
-            Page::Chats => conversation::show(app, ui),
-            Page::Wallpaper => settings::wallpaper_show(app, ui),
+        .show(ui, |ui| {
+            // The top of every page drags the window, beneath its own
+            // widgets: the empty pane, Settings, and the Calls tab's start.
+            let top = ui.max_rect();
+            caption_drag(
+                ui,
+                egui::Rect::from_min_size(top.min, vec2(top.width(), theme::TOP_BAR_HEIGHT)),
+            );
+            match app.page {
+                Page::Settings => settings::show(app, ui),
+                Page::Chats => conversation::show(app, ui),
+                // The open chat stays beside the call history.
+                Page::Calls if app.current_chat().is_some() => conversation::show(app, ui),
+                Page::Calls => calls::show(app, ui),
+                Page::Wallpaper => settings::wallpaper_show(app, ui),
+            }
         });
     if let Some(region) = search_overlay {
         pane::show_overlay(app, ui.ctx(), region);
+    }
+    if let Some(region) = info_overlay {
+        info::show_overlay(app, ui.ctx(), region);
     }
 }
 
@@ -237,7 +303,13 @@ pub(crate) fn narrow(ctx: &egui::Context) -> bool {
 }
 
 fn central_background(app: &App) -> egui::Color32 {
-    if app.page == Page::Chats {
+    // The Calls tab shows the open chat beside its history, or its own pane.
+    let conversation =
+        app.page == Page::Chats || (app.page == Page::Calls && app.current_chat().is_some());
+    if conversation && app.palette.vibrant() {
+        // The conversation paints its own translucent background.
+        egui::Color32::TRANSPARENT
+    } else if conversation {
         app.settings.wallpaper_background(&app.palette)
     } else {
         app.palette.panel
@@ -262,12 +334,11 @@ fn central_frame(app: &App) -> Frame {
 /// Steps through the window's history with the mouse's side buttons, as a
 /// browser does: `Extra1` (Back) goes back, `Extra2` (Forward) forward.
 /// Overlays are not places, and the buttons stay out of them while one is
-/// open, as the keyboard's own shortcuts do: the image preview, an expanded
-/// video, a dialog, the update screen, a picker, a reaction, a recording, a
-/// message selection, or a menu.
+/// open, as the keyboard's own shortcuts do: the media viewer, a dialog, the
+/// update screen, a picker, a reaction, a recording, a message selection, or
+/// a menu.
 fn history_buttons(app: &mut App, ctx: &egui::Context) {
     if app.image_preview.is_some()
-        || app.video_expanded
         || app.dialog.is_some()
         || app.show_update
         || app.picker.is_some()
@@ -418,18 +489,19 @@ fn drop_target(app: &mut App, ctx: &egui::Context) {
                 .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         theme::icon(ui, Icon::Paperclip, 28.0, palette.accent);
-                        theme::text(
-                            ui,
-                            format!("Drop to send to {name}"),
-                            theme::semibold(15.0),
-                            palette.text,
-                        );
+                        let drop_text = crate::i18n::gettext(app.locale, "Drop to send to {name}")
+                            .replace("{name}", &name);
+                        theme::text(ui, drop_text, theme::semibold(15.0), palette.text);
                     });
                 });
         });
 }
 
 /// Connection and history-sync banner.
+/// What the banner needs beside the caption buttons ZapFast draws: its line
+/// and a button.
+const BANNER_MIN_CONTENT: f32 = 320.0;
+
 fn banner(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let update = app.update.clone();
@@ -437,8 +509,11 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
         LinkStatus::Connected if app.syncing => (
             Icon::Refresh,
             match app.sync_percent {
-                Some(percent) => format!("Loading chat history… {percent}%"),
-                None => "Loading chat history…".to_owned(),
+                Some(percent) => {
+                    crate::i18n::gettext(app.locale, "Loading chat history… {percent}%")
+                        .replace("{percent}", &percent.to_string())
+                }
+                None => crate::i18n::gettext(app.locale, "Loading chat history…").into_owned(),
             },
             palette.accent,
             false,
@@ -448,7 +523,8 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
             let update = update.as_ref().expect("checked above");
             (
                 Icon::Info,
-                format!("ZapFast {} is available", update.version),
+                crate::i18n::gettext(app.locale, "ZapFast {version} is available")
+                    .replace("{version}", &update.version),
                 palette.accent,
                 false,
                 Some(update.url.clone()),
@@ -457,14 +533,15 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
         LinkStatus::Connected => return,
         LinkStatus::Starting | LinkStatus::Connecting => (
             Icon::Refresh,
-            "Connecting to WhatsApp…".to_owned(),
+            crate::i18n::gettext(app.locale, "Connecting to WhatsApp…").into_owned(),
             palette.secondary,
             false,
             None,
         ),
         LinkStatus::Disconnected { reason } => (
             Icon::WifiOff,
-            format!("Offline ({reason}). Reconnecting…"),
+            crate::i18n::gettext(app.locale, "Offline ({reason}). Reconnecting…")
+                .replace("{reason}", reason),
             palette.warning,
             true,
             None,
@@ -478,7 +555,7 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
         ),
         LinkStatus::Unlinked { .. } | LinkStatus::LoggedOut => (
             Icon::Smartphone,
-            "Not linked to a phone".to_owned(),
+            crate::i18n::gettext(app.locale, "Not linked to a phone").into_owned(),
             palette.warning,
             false,
             None,
@@ -492,19 +569,27 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
                 .inner_margin(Margin::symmetric(14, 6)),
         )
         .show(ui, |ui| {
+            // Over a page with no header (Settings, or no chat open) the
+            // banner takes the top-right corner from the caption buttons
+            // ZapFast draws, beside them or under them.
+            let room = caption_room(ui.ctx(), ui.max_rect(), BANNER_MIN_CONTENT);
+            caption_drag(ui, ui.max_rect().with_max_y(ui.max_rect().top() + room.top));
+            ui.add_space(room.top);
             ui.horizontal(|ui| {
+                ui.add_space(room.left);
                 // Progress/connection events wake the window. A long history
                 // sync must not redraw every message just to spin this icon.
                 theme::icon(ui, icon, 15.0, color);
                 theme::text(ui, text, theme::medium(13.0), palette.text);
                 if retry || download.is_some() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(room.right);
                         if download.is_some() {
                             if theme::soft_button(
                                 ui,
                                 &palette,
                                 Some(Icon::ExternalLink),
-                                "Update",
+                                &crate::i18n::gettext(app.locale, "Update"),
                                 false,
                             )
                             .clicked()
@@ -515,7 +600,7 @@ fn banner(app: &mut App, ui: &mut egui::Ui) {
                             ui,
                             &palette,
                             Some(Icon::Refresh),
-                            "Retry",
+                            &crate::i18n::gettext(app.locale, "Retry"),
                             false,
                         )
                         .clicked()
@@ -630,7 +715,7 @@ fn toasts(app: &mut App, ctx: &egui::Context) {
                                             14.0,
                                             palette.secondary,
                                             palette.text,
-                                            "Dismiss",
+                                            &crate::i18n::gettext(app.locale, "Dismiss"),
                                         );
                                         // Store the rect for interaction tests.
                                         ui.ctx().data_mut(|data| {
@@ -645,7 +730,7 @@ fn toasts(app: &mut App, ctx: &egui::Context) {
                                             14.0,
                                             palette.secondary,
                                             palette.text,
-                                            "Copy this message",
+                                            &crate::i18n::gettext(app.locale, "Copy this message"),
                                         )
                                         .clicked()
                                         {
@@ -661,13 +746,19 @@ fn toasts(app: &mut App, ctx: &egui::Context) {
     app.actions.extend(actions);
 }
 
-/// Draggable space for the macOS traffic-light title bar.
+/// Draggable space across the top of the linking and lock screens, which
+/// have no header: for the macOS traffic lights, or for the caption buttons
+/// ZapFast draws.
 fn titlebar_strip(app: &App, ui: &mut egui::Ui) {
     let linked = app.is_linked() && !app.app_lock.is_locked();
     if linked {
         return;
     }
-    let inset = theme::titlebar_inset(ui.ctx());
+    let inset = if theme::macos_chrome(ui.ctx()) {
+        theme::titlebar_inset(ui.ctx())
+    } else {
+        theme::caption_footprint(ui.ctx()).height
+    };
     if inset == 0.0 {
         return;
     }
@@ -686,17 +777,122 @@ fn titlebar_strip(app: &App, ui: &mut egui::Ui) {
         });
 }
 
-/// Makes `rect` drag the window.
+/// Makes `rect` drag the window, and answers a double click on it as the
+/// platform does (fastframe-titlebar).
 pub fn titlebar_drag(ui: &mut egui::Ui, rect: egui::Rect) {
-    let response = ui.interact(
-        rect,
-        ui.id().with("titlebar-drag"),
-        egui::Sense::click_and_drag(),
-    );
-    // AppKit requires StartDrag during the original mouse-down event.
-    if response.is_pointer_button_down_on() && ui.input(|input| input.pointer.primary_pressed()) {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    fastframe_titlebar::drag(ui, rect);
+}
+
+/// Makes `rect` drag the window while ZapFast draws the title bar, for the
+/// places macOS leaves to its own title bar strip: the pages, the panels at
+/// the right, and the screens over the window. Call it before the widgets
+/// inside `rect`, so they keep their clicks.
+pub(crate) fn caption_drag(ui: &mut egui::Ui, rect: egui::Rect) {
+    if theme::drawn_titlebar(ui.ctx()) && !theme::macos_chrome(ui.ctx()) {
+        titlebar_drag(ui, rect);
     }
+}
+
+/// Where a header's own widgets go beside the caption buttons ZapFast draws
+/// (see [`caption_room`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct CaptionRoom {
+    /// Width to leave free at the header's left end.
+    pub left: f32,
+    /// Width to leave free at the header's right end.
+    pub right: f32,
+    /// How far to move the header's widgets down, under the buttons, when
+    /// the header is too narrow to share the row with them.
+    pub top: f32,
+}
+
+/// The room a header laid out in `rect` leaves for the caption buttons
+/// ZapFast draws over the window's top corners. Only a header that reaches
+/// a corner shares it: the buttons' room at that end, less what already
+/// separates the header from the window's edge. A header whose own widgets
+/// need `min_content` beside the buttons and do not get it goes under them
+/// instead (`fastframe_titlebar::Footprint::reserve`). Nothing on macOS,
+/// whose traffic lights keep their own inset, or under the desktop's title
+/// bar.
+pub(crate) fn caption_room(ctx: &egui::Context, rect: egui::Rect, min_content: f32) -> CaptionRoom {
+    let footprint = theme::caption_footprint(ctx);
+    let window = ctx.content_rect();
+    let below = rect.top() - window.top();
+    if footprint.height <= below {
+        return CaptionRoom::default();
+    }
+    let left = (footprint.left - (rect.left() - window.left())).max(0.0);
+    let right = (footprint.right - (window.right() - rect.right())).max(0.0);
+    // Both ends taken as one, so a header narrower than its content and the
+    // buttons at either end moves down under them.
+    let reserve = fastframe_titlebar::Footprint {
+        left: 0.0,
+        right: left + right,
+        height: footprint.height - below,
+    }
+    .reserve(rect.width(), min_content);
+    if reserve.push_down > 0.0 {
+        CaptionRoom {
+            top: reserve.push_down,
+            ..CaptionRoom::default()
+        }
+    } else {
+        CaptionRoom {
+            left,
+            right,
+            top: 0.0,
+        }
+    }
+}
+
+/// The caption buttons ZapFast draws, over the window's top corners and
+/// above everything else in it, and the resizable edges, while the custom
+/// title bar is on (Windows and Linux).
+fn window_chrome(app: &App, ui: &mut egui::Ui) {
+    if !fastframe_titlebar::enabled() {
+        return;
+    }
+    let palette = app.palette;
+    let style = fastframe_titlebar::Style {
+        // GNOME's round buttons carry the text colour on the hover surface;
+        // Windows' glyphs are quieter, in the secondary colour.
+        icon: if cfg!(target_os = "linux") {
+            palette.text
+        } else {
+            palette.secondary
+        },
+        button: palette.surface_hover,
+        header_height: theme::TOP_BAR_HEIGHT,
+    };
+    // Literal calls, so xgettext extracts each label.
+    let minimize = crate::i18n::gettext(app.locale, "Minimize");
+    let maximize = crate::i18n::gettext(app.locale, "Maximize");
+    let restore = crate::i18n::gettext(app.locale, "Restore");
+    let close = crate::i18n::gettext(app.locale, "Close");
+    let labels = fastframe_titlebar::Labels {
+        minimize: &minimize,
+        maximize: &maximize,
+        restore: &restore,
+        close: &close,
+    };
+    fastframe_titlebar::controls(ui, &style, &labels);
+    // The buttons draw in egui's foreground layer, as the call screen, the
+    // media viewer and dialogs do; a newer area there would cover them, and a
+    // modal one would take their clicks. These are the crate's area names.
+    let layout = fastframe_titlebar::layout();
+    for (area, buttons) in [
+        ("fastframe-titlebar-left", &layout.left),
+        ("fastframe-titlebar-right", &layout.right),
+    ] {
+        if buttons.is_empty() {
+            continue;
+        }
+        ui.ctx().move_to_top(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new(area),
+        ));
+    }
+    fastframe_titlebar::resize(ui);
 }
 
 #[cfg(test)]
@@ -764,10 +960,14 @@ mod idle_tests {
             press(&mut app, egui::PointerButton::Extra2).contains(&Action::NavigateForward),
             "the forward side button steps forward"
         );
-        // An expanded video owns the screen, as it does for the keyboard.
-        app.video_expanded = true;
+        // The media viewer owns the screen, as it does for the keyboard.
+        app.image_preview = Some(crate::image_preview::PreviewState::new(
+            None,
+            "1@s.whatsapp.net".into(),
+            "m1".into(),
+        ));
         assert!(press(&mut app, egui::PointerButton::Extra1).is_empty());
-        app.video_expanded = false;
+        app.image_preview = None;
         // A dialog is not a place, and the buttons stay out of it.
         app.dialog = Some(crate::model::Dialog::NewChat);
         assert!(press(&mut app, egui::PointerButton::Extra1).is_empty());
@@ -1011,6 +1211,7 @@ mod idle_tests {
             ctx.data_mut(|data| {
                 data.remove::<egui::Rect>(chats::header_row_id());
                 data.remove::<egui::Rect>(conversation::header_row_id());
+                data.remove::<egui::Rect>(rail::rect_id());
             });
             // Frame times a click apart; egui ignores a press held too long.
             frame.set(frame.get() + 1.0 / 60.0);
@@ -1040,11 +1241,19 @@ mod idle_tests {
         let (list, header) = run(&mut app, 1180.0, Vec::new());
         assert!(list.is_some() && header.is_some());
 
-        // Narrow with no chat open: the list takes the whole window.
+        // Narrow with no chat open: the list takes the whole window beside
+        // the rail.
         app.open_chat = None;
         let (list, header) = run(&mut app, 480.0, Vec::new());
         let list = list.expect("the chat list is drawn");
-        assert!(list.width() > 400.0, "the list fills the window: {list:?}");
+        let rail = ctx
+            .data(|data| data.get_temp::<egui::Rect>(rail::rect_id()))
+            .expect("the rail stands beside the narrow list");
+        assert!(rail.left() < 1.0 && rail.right() <= list.left());
+        assert!(
+            list.width() > 400.0 - rail.width(),
+            "the list fills the rest of the window: {list:?}"
+        );
         assert!(header.is_none());
 
         // Narrow with a chat open: only the conversation, from the left edge.
@@ -1054,6 +1263,11 @@ mod idle_tests {
         settle();
         let (list, header) = run(&mut app, 480.0, Vec::new());
         assert!(list.is_none(), "no chat list beside a narrow conversation");
+        assert!(
+            ctx.data(|data| data.get_temp::<egui::Rect>(rail::rect_id()))
+                .is_none(),
+            "the rail goes with the list"
+        );
         let header = header.expect("the conversation header is drawn");
         assert!(
             header.left() < 20.0,
@@ -1262,10 +1476,10 @@ mod idle_tests {
         .0;
         app.link = LinkStatus::Connected;
         for i in 0..60 {
-            app.chats.push(crate::model::Chat::new(
-                format!("{i}@s.whatsapp.net"),
-                format!("Chat {i}"),
-            ));
+            app.chats.push(crate::model::Chat {
+                last_activity: 1,
+                ..crate::model::Chat::new(format!("{i}@s.whatsapp.net"), format!("Chat {i}"))
+            });
         }
         let ctx = egui::Context::default();
         theme::install(&ctx);
@@ -1324,5 +1538,89 @@ mod idle_tests {
             run(&mut app, Vec::new());
         }
         assert!((run(&mut app, Vec::new()) - scrolled).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_chat_opened_for_the_first_time_shows_its_end_in_the_first_frame() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        let chat = crate::model::Chat::new("123@s.whatsapp.net".into(), "Alice".into());
+        app.chats.push(chat.clone());
+        let mut conversation = crate::app::Conversation::default();
+        for i in 0..60 {
+            conversation.messages.push(crate::model::Message {
+                id: format!("m{i}"),
+                chat: chat.id.clone(),
+                sender: "123@s.whatsapp.net".into(),
+                sender_name: Some("Alice".into()),
+                from_me: false,
+                timestamp: 1000 + i,
+                content: crate::model::Content::text(format!("Message {i}")),
+                status: crate::model::Delivery::None,
+                delivered_at: None,
+                read_at: None,
+                quoted: None,
+                reactions: Vec::new(),
+                edited: false,
+                mentions: Vec::new(),
+                forwarded: false,
+                thumbnail: None,
+                history_order: None,
+            });
+        }
+        conversation.complete = true;
+        app.conversations.insert(chat.id.clone(), conversation);
+        // Another chat was open before, so the window is laid out already.
+        let other = crate::model::Chat::new("456@s.whatsapp.net".into(), "Bob".into());
+        app.chats.push(other.clone());
+        app.open_chat = Some(other.id.clone());
+
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let frame = |app: &mut App| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1180.0, 780.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| conversation::show(app, ui),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        for _ in 0..3 {
+            frame(&mut app);
+        }
+        app.open_chat = Some(chat.id.clone());
+        app.scroll_to_bottom = true;
+        let output = frame(&mut app);
+        // The text the reader sees: drawn inside its clip rect.
+        let shown: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text)
+                    if clipped.clip_rect.intersects(text.visual_bounding_rect()) =>
+                {
+                    Some(text.galley.text().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            shown.iter().any(|text| text == "Message 59"),
+            "the newest message is in view at once: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text == "Message 0"),
+            "the oldest never flashes: {shown:?}"
+        );
     }
 }

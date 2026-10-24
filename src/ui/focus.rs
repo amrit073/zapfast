@@ -6,13 +6,10 @@ use egui::{Context, FocusDirection, Id, Response};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stop {
     Composer,
+    ViewOnce,
     Send,
     Attach,
     Emoji,
-    CallStart,
-    CallAccept,
-    CallMute,
-    CallEnd,
     PhoneLink(u32),
     /// The chat header's Search, then the search pane's controls in reading
     /// order. The arrows walk its results from the field.
@@ -21,20 +18,34 @@ pub enum Stop {
     ChatSearchDate,
     ChatSearchField,
     ChatSearchDay,
-    Back,
-    Profile,
-    Sidebar,
-    NewChat,
+    /// The info panel's close or back button, then its buttons and tabs
+    /// in reading order. Its members, pictures, documents and links are
+    /// pointer and accessibility targets, like chat rows.
+    InfoClose,
+    InfoControl(u8),
+    /// The rail on the left, top to bottom, then the list header's Back
+    /// and buttons. Show the chat list takes the rail's top while the
+    /// list is hidden, and keeps Hide the chat list's place in the order.
+    Chats,
+    Calls,
+    Starred,
+    Archived,
+    Locked,
     Settings,
+    Profile,
+    Back,
+    NewChat,
+    Sidebar,
     Search,
+    /// The first chip, All, on the chat list and on the Calls page.
     All,
+    /// The Calls page's Missed chip.
+    Missed,
     Unread,
     Private,
     Favorites,
     Groups,
     Channels,
-    Archived,
-    Locked,
     /// One chip in the label row, by its position among the labels.
     Label(u8),
     ManageLabels,
@@ -237,7 +248,7 @@ mod tests {
             (Some(Stop::Composer), -1, 2),
             (Some(Stop::Attach), 1, 2),
             (Some(Stop::Attach), -1, 1),
-            (Some(Stop::Locked), 1, 0),
+            (Some(Stop::Channels), 1, 0),
             (None, 1, 0),
             (None, -1, 2),
             (Some(Stop::Composer), 5, 2),

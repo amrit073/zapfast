@@ -31,6 +31,16 @@ pub fn is_everyone(mention: &MentionRef) -> bool {
     mention.id == ALL_ID
 }
 
+/// Whether a stored mention names us, under any id we go by (`ours`: the
+/// phone number and the privacy id), or everyone.
+pub fn names_us(mention: &MentionRef, ours: &[&str]) -> bool {
+    is_everyone(mention)
+        || ours.contains(&mention.id.as_str())
+        || ours
+            .iter()
+            .any(|id| id.split('@').next() == Some(mention.user.as_str()))
+}
+
 /// Appends the everyone mention once.
 pub fn push_everyone(mentions: &mut Vec<MentionRef>) {
     if !mentions.iter().any(is_everyone) {

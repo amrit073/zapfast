@@ -5,6 +5,25 @@ use jiff::{Timestamp, Zoned};
 
 use crate::i18n::Locale;
 
+/// Normalizes supported formatting without changing an international recipient.
+/// Accepts 7 to 15 ASCII digits, an optional leading plus, and balanced brackets.
+pub fn international_phone(input: &str) -> Option<String> {
+    let input = input.trim();
+    let input = input.strip_prefix('+').unwrap_or(input);
+    let mut digits = String::new();
+    let mut bracket = false;
+    for character in input.chars() {
+        match character {
+            '0'..='9' => digits.push(character),
+            ' ' | '-' => {}
+            '(' if !bracket => bracket = true,
+            ')' if bracket => bracket = false,
+            _ => return None,
+        }
+    }
+    (!bracket && (7..=15).contains(&digits.len()) && !digits.starts_with('0')).then_some(digits)
+}
+
 /// File-loader identifier for a native path. egui requires a slash after
 /// `file://` on Windows or it interprets a drive path as a UNC hostname.
 /// Keep native characters: egui's loader does not percent-decode URLs.
@@ -270,6 +289,29 @@ pub fn moment_stamp(locale: Locale, unix_seconds: i64) -> String {
     }
 }
 
+/// The chat info line for a chat's disappearing-message timer, as WhatsApp
+/// words it: "Disappearing messages: 24 hours", "Disappearing messages: 7
+/// days", "Disappearing messages: 90 days", and "Disappearing messages: Off"
+/// for a timer WhatsApp turned off. A duration WhatsApp never offers falls
+/// back to its seconds, so an unexpected value reads as the number it is
+/// rather than as nothing.
+///
+/// `None` draws no line at all: nobody has told us this chat's timer, and
+/// saying so would be a guess.
+pub fn disappearing_line(locale: Locale, seconds: Option<u32>) -> Option<String> {
+    let seconds = seconds?;
+    use crate::i18n::gettext;
+    let value = match seconds {
+        0 => gettext(locale, "Off").into_owned(),
+        86_400 => gettext(locale, "24 hours").into_owned(),
+        604_800 => gettext(locale, "7 days").into_owned(),
+        7_776_000 => gettext(locale, "90 days").into_owned(),
+        _ => format!("{seconds}s"),
+    };
+    let label = gettext(locale, "Disappearing messages");
+    Some(format!("{label}: {value}"))
+}
+
 /// A contact's last-seen line as WhatsApp words it: "last seen today at
 /// 14:05", "last seen yesterday at 14:05", a weekday within the week, and
 /// only the date before that. The time follows the system's clock.
@@ -527,6 +569,37 @@ pub fn initials(name: &str) -> String {
     initials
 }
 
+/// A finished call's length in words, as WhatsApp's call info gives it:
+/// "45 s" under a minute, "12 min 34 s" under an hour, "1 h 2 min" past
+/// one. A part that is zero is left out ("12 min", "1 h"), and each form is
+/// a message of its own so a language orders and abbreviates the units its
+/// own way.
+pub fn call_length(locale: Locale, seconds: u64) -> String {
+    use crate::i18n::gettext;
+    let (hours, minutes, seconds) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    let text = match (hours, minutes, seconds) {
+        (0, 0, _) => gettext(locale, "{seconds} s"),
+        (0, _, 0) => gettext(locale, "{minutes} min"),
+        (0, _, _) => gettext(locale, "{minutes} min {seconds} s"),
+        (_, 0, _) => gettext(locale, "{hours} h"),
+        _ => gettext(locale, "{hours} h {minutes} min"),
+    };
+    text.replace("{hours}", &hours.to_string())
+        .replace("{minutes}", &minutes.to_string())
+        .replace("{seconds}", &seconds.to_string())
+}
+
+/// A running call's clock, as the call screen counts it: `m:ss`, or
+/// `h:mm:ss` past an hour.
+pub fn call_duration(seconds: u64) -> String {
+    let (hours, minutes, seconds) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
 /// Formats a phone number with a plus sign and country-appropriate grouping.
 pub fn phone(digits: &str) -> String {
     let digits: String = digits.chars().filter(char::is_ascii_digit).collect();
@@ -685,6 +758,25 @@ pub fn tray_template_rgba(size: usize) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_call_length_reads_the_way_the_phone_shows_it() {
+        assert_eq!(super::call_duration(0), "0:00");
+        assert_eq!(super::call_duration(65), "1:05");
+        assert_eq!(super::call_duration(3600 + 2 * 60 + 3), "1:02:03");
+    }
+
+    #[test]
+    fn a_finished_call_length_reads_in_words() {
+        use crate::i18n::Locale;
+        let length = |seconds| super::call_length(Locale::English, seconds);
+        assert_eq!(length(45), "45 s");
+        assert_eq!(length(754), "12 min 34 s");
+        assert_eq!(length(720), "12 min");
+        assert_eq!(length(3725), "1 h 2 min");
+        assert_eq!(length(3600), "1 h");
+        assert_eq!(super::call_length(Locale::German, 754), "12 Min. 34 Sek.");
+    }
+
     #[test]
     fn the_contact_editor_keeps_names_as_they_were_saved() {
         let names = |name, first| super::editor_names(name, first);
@@ -1017,6 +1109,27 @@ mod tests {
         assert_eq!(duration(75), "1:15");
     }
 
+    /// Only WhatsApp's own durations get a name, an explicit zero reads as
+    /// off, and a chat whose timer nobody has mentioned has no line at all.
+    #[test]
+    fn disappearing_timers_read_as_whatsapp_words_them() {
+        let line = |seconds| {
+            crate::util::disappearing_line(Locale::English, seconds)
+                .unwrap_or_default()
+                .replace("Disappearing messages: ", "")
+        };
+        assert_eq!(line(Some(0)), "Off");
+        assert_eq!(line(Some(86_400)), "24 hours");
+        assert_eq!(line(Some(604_800)), "7 days");
+        assert_eq!(line(Some(7_776_000)), "90 days");
+        assert_eq!(line(Some(3_600)), "3600s");
+        assert_eq!(
+            crate::util::disappearing_line(Locale::English, None),
+            None,
+            "an unknown timer says nothing"
+        );
+    }
+
     #[test]
     fn icon_is_opaque_in_the_middle_and_clear_at_the_corners() {
         let icon = app_icon_rgba(32);
@@ -1051,5 +1164,28 @@ mod tests {
     fn both_marks_render() {
         assert!(render_mark(MARK, 128).is_some());
         assert!(render_mark(SMALL_MARK, 22).is_some());
+    }
+}
+
+#[cfg(test)]
+mod international_phone_tests {
+    /// Supported formatting preserves every recipient digit and rejects extra suffixes.
+    #[test]
+    fn supported_formatting_never_swallows_extra_recipient_digits() {
+        for input in ["+1 (555) 123-4567", "15551234567", "  +55 11 99999-9999  "] {
+            assert!(super::international_phone(input).is_some(), "{input}");
+        }
+        for input in [
+            "+1 (555) 123-4567 ext. 89",
+            "05512345678",
+            "1234567890123456",
+            "123456",
+            "++15551234567",
+            "1+5551234567",
+            "+1 (555 1234567",
+            "١٥٥٥١٢٣٤٥٦٧",
+        ] {
+            assert!(super::international_phone(input).is_none(), "{input}");
+        }
     }
 }
