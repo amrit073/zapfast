@@ -73,6 +73,11 @@ impl Worker {
                 self.emit(Event::Error(format!(
                     "Could not link by phone number: {error}"
                 )));
+                // A failed request may have consumed the connection's QR refs.
+                // Start a fresh client when there is no QR left to show.
+                if self.qr.is_none() {
+                    let _ = self.commands.send(Command::Relink);
+                }
             }
         }
         let status = self.unlinked();
@@ -173,6 +178,17 @@ mod tests {
                 .try_iter()
                 .any(|event| matches!(event, Event::Error(_)))
         );
+    }
+
+    #[tokio::test]
+    async fn failed_request_without_a_qr_restarts_the_connection() {
+        let (mut worker, _, mut commands, _) = super::super::receipt_tests::worker();
+        pending(&mut worker, 1);
+        worker.qr = None;
+        worker.finish_pair_code(1, Err("Synthetic request failure".into()));
+        assert!(matches!(commands.try_recv().unwrap(), Command::Relink));
+        assert!(worker.pair_request.is_none());
+        assert!(worker.pairing_phone.is_none());
     }
 
     #[tokio::test]

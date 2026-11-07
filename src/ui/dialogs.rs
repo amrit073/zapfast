@@ -6,6 +6,11 @@ use crate::app::App;
 use crate::model::{Action, Dialog};
 use crate::theme::{self, Icon};
 
+/// The dialogs' `Modal`, the layer they are drawn on.
+pub(crate) fn modal_id() -> egui::Id {
+    egui::Id::new("dialog")
+}
+
 pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(dialog) = app.dialog.clone() else {
         return;
@@ -21,7 +26,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             22
         }))
         .shadow(palette.modal_shadow());
-    let response = egui::Modal::new(egui::Id::new("dialog"))
+    let response = egui::Modal::new(modal_id())
         .frame(frame)
         .backdrop_color(palette.shadow)
         .show(ctx, |ui| {
@@ -40,6 +45,13 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     380.0
                 }
                 Dialog::ConfirmClearChat(_) => 380.0,
+                Dialog::ExportChat { .. } => {
+                    380.0_f32.min((ui.ctx().content_rect().width() - 48.0).max(180.0))
+                }
+                Dialog::ConfirmBlock { .. } => 380.0,
+                Dialog::BlockedContacts => {
+                    420.0_f32.min((ui.ctx().content_rect().width() - 48.0).max(180.0))
+                }
                 Dialog::ConfirmDeleteMessage { .. } | Dialog::ConfirmDeleteSelection { .. } => {
                     380.0
                 }
@@ -89,6 +101,14 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ConfirmLockChat(id) => confirm_lock_chat(app, ui, &id),
                 Dialog::ConfirmDeleteChat(id) => confirm_delete_chat(app, ui, &id),
                 Dialog::ConfirmClearChat(id) => confirm_clear_chat(app, ui, &id),
+                Dialog::ExportChat {
+                    chat,
+                    include_media,
+                } => super::chat_export::show(app, ui, &chat, include_media),
+                Dialog::BlockedContacts => super::blocking::list(app, ui),
+                Dialog::ConfirmBlock { chat, blocked, .. } => {
+                    super::blocking::confirmation(app, ui, &chat, blocked)
+                }
                 Dialog::ConfirmDeleteMessage {
                     chat,
                     message,
@@ -426,7 +446,7 @@ fn confirm_lock_chat(app: &mut App, ui: &mut egui::Ui, id: &str) {
         ui,
         crate::i18n::gettext(
             app.locale,
-            "This moves the chat to the Locked tab, hiding it from the normal chat list, search, unread badges, and notifications. The lock status also syncs to your phone. Open Locked with a separate local ZapFast code to read it. Sending from locked chats is not supported yet.",
+            "This moves the chat to the Locked tab, hiding it from the normal chat list, search, unread badges, and notifications. The lock status also syncs to your phone. Open Locked with a separate local ZapFast code to read it.",
         ),
         theme::regular(13.0),
         palette.secondary,
@@ -540,7 +560,10 @@ pub(super) fn contact_choices(app: &App, needle: &str) -> Vec<crate::model::Cont
                 && app.me.as_deref() != Some(contact.id.as_str())
                 && !app.chat(&contact.id).is_some_and(|chat| chat.locked)
                 && (needle.is_empty()
-                    || crate::util::search_key(&app.display_name(&contact.id)).contains(needle)
+                    || crate::util::search_matches(
+                        &crate::util::search_key(&app.display_name(&contact.id)),
+                        needle,
+                    )
                     || crate::model::phone_of(&contact.id)
                         .is_some_and(|phone| phone.contains(needle)))
         })
@@ -633,7 +656,7 @@ fn forward(app: &mut App, ui: &mut egui::Ui, messages: &[String]) {
     let mut chats: Vec<_> = app
         .chats
         .iter()
-        .filter(|chat| forwardable(chat))
+        .filter(|chat| forwardable(chat) && !app.blocklist.contains(&chat.id))
         .filter(|chat| {
             needle.is_empty()
                 || app.chat_title(chat).to_lowercase().contains(&needle)
@@ -855,9 +878,11 @@ fn forward_footer(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-/// Uses the model's send permissions to reject unavailable forwarding destinations.
-fn forwardable(chat: &crate::model::Chat) -> bool {
-    chat.can_send()
+/// Uses the model's send permissions to reject unavailable forwarding
+/// destinations. Locked chats stay out of the picker, which would otherwise
+/// list them outside the locked folder.
+pub(crate) fn forwardable(chat: &crate::model::Chat) -> bool {
+    chat.can_send() && !chat.locked
 }
 
 fn title(ui: &mut egui::Ui, app: &mut App, label: &str) {
@@ -1579,12 +1604,12 @@ fn confirm_remove(app: &mut App, ui: &mut egui::Ui, id: crate::model::AccountId)
     );
 }
 
-/// A confirmation for something that cannot be undone: the question, what it
-/// destroys (the first paragraph in the text colour, any after it as a smaller
+/// A confirmation for a destructive or sensitive action: the question, its
+/// consequences (the first paragraph in the text colour, any after it as a smaller
 /// note), then Cancel and a red button that queues `action` and closes the
 /// dialog. Callers pass translated text. Enter is deliberately not bound: a
 /// stray keypress must not destroy anything.
-fn confirm_destructive(
+pub(super) fn confirm_destructive(
     app: &mut App,
     ui: &mut egui::Ui,
     heading: &str,
@@ -1606,7 +1631,13 @@ fn confirm_destructive(
     let cancel = crate::i18n::gettext(app.locale, "Cancel");
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if danger_button(ui, app, button).clicked() {
+            let enabled = !matches!(app.dialog, Some(Dialog::ConfirmBlock { .. }))
+                || (app.is_connected() && app.blocklist.editable());
+            if ui
+                .add_enabled_ui(enabled, |ui| danger_button(ui, app, button))
+                .inner
+                .clicked()
+            {
                 app.actions.extend(actions);
                 app.actions.push(Action::CloseDialog);
             }

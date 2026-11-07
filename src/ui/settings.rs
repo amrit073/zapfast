@@ -212,9 +212,7 @@ impl Section {
 }
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
-    if theme::chrome_in_headers(ui.ctx()) {
-        super::banner(app, ui);
-    }
+    super::banner(app, ui);
     let palette = app.palette;
     let locale = app.locale;
     // The caption buttons ZapFast draws, beside the column's title row when
@@ -591,6 +589,23 @@ fn sections(app: &App) -> Vec<Section> {
         |settings| &mut settings.send_typing,
     );
     app_lock_rows(app, &mut privacy);
+    privacy.row(
+        translated(locale, "Blocked contacts"),
+        "",
+        move |ui, app| {
+            if theme::pill_button(
+                ui,
+                &app.palette,
+                &crate::i18n::gettext(locale, "Manage"),
+                false,
+            )
+            .clicked()
+            {
+                app.actions
+                    .push(Action::ShowDialog(Dialog::BlockedContacts));
+            }
+        },
+    );
     // The account values live on the phone: they are shown once fetched and
     // edited only while connected with a fresh snapshot.
     let editable = app.is_connected() && app.account_privacy.editable();
@@ -1208,9 +1223,7 @@ fn language_picker(ui: &mut egui::Ui, app: &mut App) {
 
 /// Wallpaper colour picker and live preview.
 pub fn wallpaper_show(app: &mut App, ui: &mut egui::Ui) {
-    if theme::chrome_in_headers(ui.ctx()) {
-        super::banner(app, ui);
-    }
+    super::banner(app, ui);
     let palette = app.palette;
     let body_height = ui.available_height().max(0.0);
     ui.with_layout(

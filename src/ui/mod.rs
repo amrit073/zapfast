@@ -1,8 +1,11 @@
 //! Window layout: panels, overlays, keyboard shortcuts.
 
 pub mod accounts;
+mod attachment_preview;
+mod blocking;
 pub mod call;
 pub mod calls;
+mod chat_export;
 pub mod chats;
 pub mod conversation;
 pub mod dialogs;
@@ -13,17 +16,20 @@ pub mod image_preview;
 pub mod info;
 pub mod keys;
 pub mod labels;
+pub mod list_nav;
 pub mod locations;
 pub mod lock;
 pub mod login;
 pub mod message_info;
 pub mod new_group;
+pub(crate) mod overlay;
 pub mod pane;
 pub mod picker;
 pub mod polls;
 pub mod rail;
 pub mod settings;
 pub mod update;
+mod voice_bar;
 pub mod widgets;
 
 use egui::{Align2, CornerRadius, Frame, Margin, Stroke, vec2};
@@ -38,6 +44,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let ctx = &ctx;
     track_keyboard_focus(ctx);
     info::release_thumbnails(app, ctx);
+    picker::release_gif_animations(app, ctx);
+    // The message list sets it again when it is drawn with focus.
+    app.messages_focused = false;
     // Locked, nothing else is drawn: no chat list, no messages, no dialogs,
     // no toasts, and no shortcut reaches them.
     if app.app_lock.is_locked() {
@@ -69,7 +78,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         // The call screen covers the chats.
         && (app.call.is_none() || app.call_surface_hidden)
         // A name typed in the info panel keeps Tab between its fields.
-        && !(app.info_visible() && (app.contact_edit.is_some() || app.group_name_edit.is_some()))
+        && !(app.info_visible()
+            && (app.contact_edit.is_some()
+                || app.group_name_edit.is_some()
+                || app.group_description_edit.is_some()))
         && !egui::Popup::is_any_open(ctx);
     focus::begin(ctx, main_navigation);
     // The open chat's composer records its rect again below, if there is one.
@@ -79,17 +91,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         login::show(app, ui);
         accounts::corner(app, ctx);
         dialogs::show(app, ctx);
+        overlay::finish(ctx);
         update::show(app, ctx);
         toasts(app, ctx);
         focus_ring(app, ctx);
         announce(app, ctx);
         window_chrome(app, ui);
         return;
-    }
-    // Where the headers share the top edge with the window's buttons, the
-    // banner goes under the open chat's header instead.
-    if !theme::chrome_in_headers(ctx) {
-        banner(app, ui);
     }
     let narrow = narrow(ctx);
     let list_only = narrow && list_pane_only(app);
@@ -114,6 +122,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     image_preview::show_sticker(app, ctx);
     call::show(app, ctx);
     image_editor::show(app, ctx);
+    overlay::finish(ctx);
     drop_target(app, ctx);
     toasts(app, ctx);
     focus_ring(app, ctx);
@@ -158,6 +167,9 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
     }
     let crowded = app.info_visible()
         && ui.available_width() - list_width < pane::INFO_MIN + pane::INFO_CONVERSATION_MIN;
+    if macos_title_strip(app, ui.ctx()) {
+        title_strip(app, ui);
+    }
     if !narrow(ui.ctx()) && !crowded {
         rail::show(app, ui, !full_list);
         if full_list {
@@ -181,7 +193,10 @@ fn main_view(app: &mut App, ui: &mut egui::Ui, list_only: bool) {
                 Page::Chats => conversation::show(app, ui),
                 // The open chat stays beside the call history.
                 Page::Calls if app.current_chat().is_some() => conversation::show(app, ui),
-                Page::Calls => calls::show(app, ui),
+                Page::Calls => {
+                    banner(app, ui);
+                    calls::show(app, ui);
+                }
                 Page::Wallpaper => settings::wallpaper_show(app, ui),
             }
         });
@@ -328,7 +343,23 @@ fn central_frame(app: &App) -> Frame {
         Stroke::NONE
     };
 
-    Frame::new().fill(central_background(app)).stroke(stroke)
+    let background = central_background(app);
+    // An open conversation paints its wallpaper over the whole central
+    // panel. Its opaque background already covers this fill, so drawing it
+    // twice wastes GPU work on every scroll. Keep the fill beneath alpha
+    // themes and attachment review, where it can show through.
+    let conversation_covers_panel = matches!(app.page, Page::Chats)
+        && app.current_chat().is_some()
+        && app.pending.is_empty()
+        && !app.palette.vibrant()
+        && background.a() == 255;
+    Frame::new()
+        .fill(if conversation_covers_panel {
+            egui::Color32::TRANSPARENT
+        } else {
+            background
+        })
+        .stroke(stroke)
 }
 
 /// Steps through the window's history with the mouse's side buttons, as a
@@ -385,26 +416,46 @@ pub fn focus_ring_id() -> egui::Id {
 }
 
 /// Tab shows where focus is; a pointer press hides it again. Widgets scroll
-/// themselves into view through `theme::reveal_focus`.
+/// themselves into view through `theme::reveal_focus`. In a list that rings
+/// its current item (`list_nav::outline_only`), the keys that move the item
+/// count as keyboard navigation too: the reader may have reached the list by
+/// a shortcut or a screen reader rather than Tab.
 fn track_keyboard_focus(ctx: &egui::Context) {
-    let (tab, pressed) = ctx.input(|input| {
-        let tab = input.events.iter().any(|event| {
+    // Checked before the list registers again this frame, so last frame's
+    // registration counts.
+    let in_list = ctx
+        .memory(|memory| memory.focused())
+        .is_some_and(|id| list_nav::was_outline_only(ctx, id));
+    let (navigated, pressed) = ctx.input(|input| {
+        let navigated = input.events.iter().any(|event| {
             matches!(
                 event,
                 egui::Event::Key {
-                    key: egui::Key::Tab,
+                    key,
                     pressed: true,
                     ..
-                }
+                } if *key == egui::Key::Tab
+                    || (in_list
+                        && matches!(
+                            key,
+                            egui::Key::ArrowUp
+                                | egui::Key::ArrowDown
+                                | egui::Key::ArrowLeft
+                                | egui::Key::ArrowRight
+                                | egui::Key::Home
+                                | egui::Key::End
+                                | egui::Key::PageUp
+                                | egui::Key::PageDown
+                        ))
             )
         });
-        (tab, input.pointer.any_pressed())
+        (navigated, input.pointer.any_pressed())
     });
     let mut keyboard = ctx.data(|data| {
         data.get_temp::<bool>(theme::keyboard_focus_id())
             .unwrap_or(false)
     });
-    if tab {
+    if navigated {
         keyboard = true;
     } else if pressed {
         keyboard = false;
@@ -432,6 +483,11 @@ fn focus_ring(app: &App, ctx: &egui::Context) {
     let custom = ctx
         .data(|data| data.get_temp::<theme::FocusOutline>(response.id.with("focus-outline")))
         .filter(|outline| outline.frame == ctx.cumulative_frame_nr());
+    // A list rings its current item only. With that item not drawn this
+    // frame there is nothing to ring, and never the whole list.
+    if custom.is_none() && list_nav::is_outline_only(ctx, response.id) {
+        return;
+    }
     if !keyboard && !ctx.text_edit_focused() {
         return;
     }
@@ -777,6 +833,71 @@ fn titlebar_strip(app: &App, ui: &mut egui::Ui) {
         });
 }
 
+/// Height of the strip that holds the macOS traffic lights over the rail
+/// alone: AppKit's own title bar on macOS 26 and 27.
+pub const TITLE_STRIP_HEIGHT: f32 = 32.0;
+
+/// Whether the traffic lights get a strip of their own across the window's
+/// top: on macOS, out of full screen, while the hidden chat list leaves the
+/// rail alone at the left, too narrow for them. With the list shown they sit
+/// in its header's row instead. Decided from the state that lays the left
+/// column out, before anything is laid out, so `main` can place the lights
+/// for the same frame.
+pub fn macos_title_strip(app: &App, ctx: &egui::Context) -> bool {
+    if !theme::macos_chrome(ctx)
+        || theme::traffic_light_inset(ctx) == 0.0
+        || !app.is_linked()
+        || app.app_lock.is_locked()
+        || narrow(ctx)
+    {
+        return false;
+    }
+    let full_list = app.sidebar_mode() == SidebarDisplayMode::Expanded || app.page == Page::Calls;
+    // The info panel can push the rail aside, as `main_view` decides.
+    let crowded = app.info_visible()
+        && ctx.content_rect().width() - chats::compact_width(ctx)
+            < pane::INFO_MIN + pane::INFO_CONVERSATION_MIN;
+    !full_list && !crowded
+}
+
+/// The strip's height in points at the current zoom, whole points of room
+/// above and below AppKit's 14-point buttons so they land on whole pixels.
+pub fn title_strip_height(ctx: &egui::Context) -> f32 {
+    appkit_bar_height(TITLE_STRIP_HEIGHT, ctx.zoom_factor())
+}
+
+/// `bar` adjusted so the room above and below the 14-point traffic lights
+/// is a whole number of window points at `zoom`.
+pub fn appkit_bar_height(bar: f32, zoom: f32) -> f32 {
+    const BUTTON: f32 = 14.0;
+    let room = ((bar * zoom - BUTTON) / 2.0).round().max(0.0);
+    (2.0 * room + BUTTON) / zoom
+}
+
+/// The strip over the rail alone: the rail's surface, with the hairline the
+/// headers end on under it beside the rail. It drags the window.
+fn title_strip(app: &App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    egui::Panel::top("macos-title-strip")
+        .exact_size(title_strip_height(ui.ctx()))
+        .show_separator_line(false)
+        .frame(Frame::new().fill(palette.rail()))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            titlebar_drag(ui, rect);
+            let ppp = ui.ctx().pixels_per_point();
+            let left = ((rect.left() + rail::WIDTH - 1.0) * ppp).round() / ppp;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(left, rect.bottom() - 1.0),
+                    egui::pos2(rect.right(), rect.bottom()),
+                ),
+                0.0,
+                palette.outline,
+            );
+        });
+}
+
 /// Makes `rect` drag the window, and answers a double click on it as the
 /// platform does (fastframe-titlebar).
 pub fn titlebar_drag(ui: &mut egui::Ui, rect: egui::Rect) {
@@ -925,6 +1046,34 @@ mod idle_tests {
                 egui::Color32::from_rgba_unmultiplied(233, 237, 239, 32)
             )
         );
+    }
+
+    #[test]
+    fn conversation_skips_only_a_redundant_opaque_background() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = App::headless(
+            crate::paths::AppDirs::under(root.path()),
+            crate::settings::Settings::default(),
+        )
+        .0;
+        let chat = crate::model::Chat::new("test-chat".into(), "Test".into());
+        app.open_chat = Some(chat.id.clone());
+        app.chats.push(chat);
+        app.page = Page::Chats;
+        app.palette = crate::theme::Palette::dark();
+        assert_eq!(central_frame(&app).fill, egui::Color32::TRANSPARENT);
+
+        // A translucent wallpaper needs the original background underneath.
+        app.palette.chat = egui::Color32::from_rgba_premultiplied(12, 12, 12, 32);
+        assert_eq!(central_frame(&app).fill, central_background(&app));
+
+        // Staged attachments can replace the wallpaper with a review panel.
+        app.palette = crate::theme::Palette::dark();
+        app.stage(crate::app::Pending::File("test.txt".into()));
+        assert_eq!(central_frame(&app).fill, central_background(&app));
+
+        app.page = Page::Settings;
+        assert_eq!(central_frame(&app).fill, app.palette.panel);
     }
 
     #[test]

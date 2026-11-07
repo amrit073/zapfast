@@ -40,8 +40,11 @@ struct Cli {
     #[arg(long, requires = "demo_tour", value_name = "PATH")]
     demo_tour_events: Option<std::path::PathBuf>,
 
-    /// Which tour to play: `launch` (41 seconds) or `whats-new` (what 0.16
-    /// added, 86 seconds).
+    /// Which tour to play: `launch` (41 seconds), `whats-new` (what 0.16
+    /// added, 86 seconds), `calls` (39 seconds; `ZAPFAST_DEMO_CALL_FEEDS`
+    /// puts video clips in its call tiles) or `whats-new-21` (what 0.21
+    /// added, 49 seconds). `ZAPFAST_DEMO_FONT=inter` draws any tour in the
+    /// bundled Inter.
     #[cfg(feature = "demo")]
     #[arg(
         long,
@@ -80,7 +83,7 @@ struct Cli {
     demo_titlebar: bool,
 
     /// Demo view: `chat`, `phone-menu`, `empty`, `settings`, `login`,
-    /// `pair`, `shortcuts`, `about`, `info`, `mention`, `light`, or a comma-separated
+    /// `pair`, `shortcuts`, `about`, `info`, `mention`, `voice-presence`, `light`, or a comma-separated
     /// mix such as `chat,light`.
     #[cfg(feature = "demo")]
     #[arg(long)]
@@ -438,7 +441,7 @@ fn run() -> eframe::Result<()> {
             // later.
             let transparent = lease.peek(|app: &app::App| {
                 zapfast::backdrop::transparent_window(
-                    app.settings.theme == zapfast::settings::ThemeChoice::Messages,
+                    app.palette.vibrant(),
                     app.palette.window.a() < 255,
                 )
             });
@@ -470,6 +473,12 @@ fn run() -> eframe::Result<()> {
                 Box::new(move |cc| {
                     let mut app = lease.take(&cc.egui_ctx);
                     app.attach(&cc.egui_ctx);
+                    #[cfg(target_os = "linux")]
+                    app.attach_clipboard(
+                        raw_window_handle::HasDisplayHandle::display_handle(cc)
+                            .ok()
+                            .map(|display| display.as_raw()),
+                    );
                     // Registered here rather than in `attach`, which headless
                     // tests call too: they must never start a browser.
                     #[cfg(all(unix, not(target_os = "macos")))]
@@ -793,8 +802,11 @@ impl Shell {
         }
         // The chat header is 60 points and zooms; the linking screen keeps
         // AppKit's own 28-point strip.
-        let title_bar = if app.is_linked() && !app.app_lock.is_locked() {
-            zapfast::theme::TOP_BAR_HEIGHT
+        // Over the rail alone the lights have a 32-point strip of their own.
+        let title_bar = if zapfast::ui::macos_title_strip(app, ctx) {
+            zapfast::ui::title_strip_height(ctx)
+        } else if app.is_linked() && !app.app_lock.is_locked() {
+            zapfast::ui::appkit_bar_height(zapfast::theme::TOP_BAR_HEIGHT, ctx.zoom_factor())
         } else {
             28.0 / ctx.zoom_factor()
         };
@@ -822,6 +834,8 @@ impl Shell {
             egui::Popup::open_id(ui.ctx(), zapfast::demo::phone_menu_popup_id());
         }
         app.frame_ui(ui);
+        #[cfg(target_os = "macos")]
+        app.match_window_transparency(ui.ctx(), self.transparent);
         let startups: Vec<_> = app
             .accounts
             .iter_mut()

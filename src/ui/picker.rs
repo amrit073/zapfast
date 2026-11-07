@@ -33,6 +33,37 @@ enum Row {
     },
 }
 
+/// The picker's `Area`, the layer it is drawn on.
+pub(crate) fn area_id() -> egui::Id {
+    egui::Id::new("picker")
+}
+
+/// The reaction picker's `Area`, the layer it is drawn on.
+pub(crate) fn reaction_area_id() -> egui::Id {
+    egui::Id::new("reaction-picker")
+}
+
+/// The animation cache of the GIF tab's playing tiles.
+pub(crate) fn gif_animations() -> egui::Id {
+    egui::Id::new("gif-picker")
+}
+
+/// Whether the GIF tab is what the picker draws this pass.
+fn gif_tab_shown(app: &App) -> bool {
+    app.picker == Some(PickerTab::Gifs)
+        && app.reaction_target.is_none()
+        && !app.app_lock.is_locked()
+}
+
+/// Frees the GIF tab's animations once it is not drawn. The tab is their only
+/// caller, so they would never reach another idle sweep. Called before the
+/// lock screen's early return, since a locked app draws no picker either.
+pub fn release_gif_animations(app: &App, ctx: &egui::Context) {
+    if !gif_tab_shown(app) {
+        crate::animation::release(ctx, gif_animations());
+    }
+}
+
 pub fn show(app: &mut App, ctx: &egui::Context) {
     if app.picker == Some(PickerTab::Emoji) && app.reaction_target.is_none() {
         if app.picker_recent.is_none() {
@@ -57,7 +88,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         .left()
         .clamp(screen.left() + 8.0, (screen.right() - WIDTH - 8.0).max(8.0));
     let y = (anchor.top() - HEIGHT - 10.0).max(screen.top() + 8.0);
-    let area = egui::Area::new(egui::Id::new("picker"))
+    let area = egui::Area::new(area_id())
         .fixed_pos(pos2(x, y))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
@@ -421,7 +452,7 @@ fn reaction_picker(app: &mut App, ctx: &egui::Context) {
                 message.content.summary_in(app.locale),
             )
         });
-    let area = egui::Area::new(egui::Id::new("reaction-picker"))
+    let area = egui::Area::new(reaction_area_id())
         .fixed_pos(pos)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
@@ -998,8 +1029,11 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                 if response.changed() {
                     app.actions.push(Action::SettingsChanged);
                 }
-                if response.lost_focus() && !app.settings.giphy_key.trim().is_empty() {
-                    app.actions.push(Action::SearchGifs(String::new()));
+                if response.lost_focus()
+                    && !app.settings.giphy_key.trim().is_empty()
+                    && app.gif_results.is_empty()
+                {
+                    app.actions.push(Action::SearchGifs(app.gif_query.clone()));
                 }
                 response
             });
@@ -1009,7 +1043,9 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
             field.response.rect,
             f32::from(theme::RADIUS),
         );
-        return;
+        if app.gif_results.is_empty() {
+            return;
+        }
     }
     let mut query = app.picker_search.clone();
     let submit = ui.memory(|memory| memory.has_focus(egui::Id::new("gif-search")))
@@ -1019,8 +1055,12 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
     if query != app.picker_search {
         app.picker_search = query.clone();
     }
-    if submit && query.trim() != app.gif_query.trim() {
-        app.actions.push(Action::SearchGifs(query));
+    if submit && (query.trim() != app.gif_query.trim() || app.gif_error.is_some()) {
+        if query.trim() == app.gif_query.trim() && app.gif_next_offset.is_some() {
+            app.actions.push(Action::MoreGifs);
+        } else {
+            app.actions.push(Action::SearchGifs(query));
+        }
     }
     if app.gif_pending {
         ui.horizontal(|ui| {
@@ -1032,7 +1072,7 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                 palette.secondary,
             );
         });
-    } else if let Some(error) = &app.gif_error {
+    } else if let Some(error) = app.gif_error.as_ref().filter(|error| !error.bad_key) {
         theme::paragraph(ui, &error.message, theme::regular(13.0), palette.danger);
     }
     let results = app.gif_results.clone();
@@ -1054,7 +1094,41 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                         let (rect, response) = ui.allocate_exact_size(size, Sense::click());
                         if ui.is_rect_visible(rect) {
                             ui.painter().rect_filled(rect, 6.0, palette.surface);
-                            if let Some(still) = &gif.still {
+                            if !app.gif_pending
+                                && gif.animated.is_none()
+                                && !app.gif_requested.contains(&gif.id)
+                                && let Some((url, extension)) = &gif.animated_source
+                            {
+                                app.actions.push(Action::FetchGifAnimation {
+                                    id: gif.id.clone(),
+                                    url: url.clone(),
+                                    extension: extension.clone(),
+                                });
+                            }
+                            // Visible tiles play; the animation player pauses
+                            // tiles that are off screen. The still stays
+                            // underneath while a preview decodes or fails.
+                            let playing = gif.animated.as_ref().and_then(|path| {
+                                match crate::animation::frame_with_cache(
+                                    ui,
+                                    path,
+                                    rect,
+                                    true,
+                                    gif_animations(),
+                                ) {
+                                    crate::animation::Frame::Ready(texture) => Some(texture),
+                                    _ => None,
+                                }
+                            });
+                            if let Some(texture) = playing {
+                                egui::Image::from_texture(egui::load::SizedTexture::new(
+                                    texture.id(),
+                                    texture.size_vec2(),
+                                ))
+                                .fit_to_exact_size(size)
+                                .corner_radius(6.0)
+                                .paint_at(ui, rect);
+                            } else if let Some(still) = &gif.still {
                                 widgets::file_image(ui, still)
                                     .fit_to_exact_size(size)
                                     .corner_radius(6.0)
@@ -1077,6 +1151,16 @@ fn gif_tab(app: &mut App, ui: &mut egui::Ui, palette: &Palette) {
                         }
                     }
                 });
+            }
+            if !app.gif_pending && app.gif_next_offset.is_some() {
+                let label = if app.gif_error.is_some() {
+                    gettext(app.locale, "Retry")
+                } else {
+                    gettext(app.locale, "Load more")
+                };
+                if theme::soft_button(ui, palette, None, &label, false).clicked() {
+                    app.actions.push(Action::MoreGifs);
+                }
             }
             if results.is_empty() && !app.gif_pending && app.gif_error.is_none() {
                 ui.add_space(20.0);
@@ -1655,6 +1739,11 @@ fn sticker_grid(
                     .width(menu_width)
                     .frame(widgets::menu_frame(palette))
                     .show(|ui| {
+                        // Lottie is receive-only; picker send/favorite/pack
+                        // actions currently assume raw WebP bytes.
+                        if path.extension().is_some_and(|extension| extension == "was") {
+                            return;
+                        }
                         if shelf == Shelf::Favorites {
                             if widgets::menu_item(ui, palette, Some(Icon::StarOff), &remove_label) {
                                 choices.forget = Some(path.clone());
@@ -1685,6 +1774,7 @@ fn sticker_grid(
                 if response
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .clicked()
+                    && path.extension().is_none_or(|extension| extension != "was")
                 {
                     choices.send = Some(path.clone());
                 }
@@ -1871,6 +1961,9 @@ pub(crate) fn moves(ctx: &egui::Context, path: &Path) -> bool {
 /// Returns `None` when the header cannot be read, so the caller can tell a read
 /// failure from a still image and retry instead of memoizing the failure.
 fn probe_motion(path: &Path) -> Option<bool> {
+    if path.extension().is_some_and(|extension| extension == "was") {
+        return Some(true);
+    }
     let mut head = [0u8; 64];
     let mut file = std::fs::File::open(path).ok()?;
     let read = std::io::Read::read(&mut file, &mut head).ok()?;
