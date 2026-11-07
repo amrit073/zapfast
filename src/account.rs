@@ -100,9 +100,6 @@ pub struct Account {
     pub new_contact_name: String,
     pub new_contact_last: String,
     pub new_contact_pending: bool,
-    pub contact_lookup: Option<crate::model::ContactLookup>,
-    pub contact_lookup_generation: u64,
-
     pub(crate) new_contact_sequence: u64,
     pub(crate) new_contact_request: Option<u64>,
     pub(crate) new_contact_dialog_request: Option<u64>,
@@ -236,9 +233,6 @@ impl Account {
             new_contact_name: String::new(),
             new_contact_last: String::new(),
             new_contact_pending: false,
-            contact_lookup: None,
-            contact_lookup_generation: 0,
-
             new_contact_sequence: 0,
             new_contact_request: None,
             new_contact_dialog_request: None,

@@ -6,18 +6,6 @@ redirect_from:
 nav_order: 3
 ---
 
-## Online and last seen
-
-Open a one-to-one conversation to see **online** or **last seen today at …**
-below the contact's name. The contact information dialog shows the same state.
-ZapFast refreshes presence when you open a conversation, including one already
-cached locally, and when the account reconnects.
-
-These details appear only when WhatsApp supplies them and the contact's privacy
-settings allow you to see them. ZapFast does not estimate last seen from messages
-or typing, and it keeps each account's presence separate. If nothing appears,
-check whether the same account can see that contact's last seen in WhatsApp.
-
 ## Writing
 
 Undo and redo in the message field apply to its current chat and account.
@@ -211,9 +199,15 @@ again later.
 The sticker tab works like WhatsApp's: a row of tabs holds **Recent**
 (the clock), **Favorites** (the star), each of your packs, and **+** for
 adding more. ZapFast adds **Received** (the speech bubble) after Favorites.
-Click a WebP sticker to send it; the picker stays open for the next one. Animated stickers play on hover.
+<<<<<<< HEAD
+Click a WebP sticker to send it. Animated stickers play on hover.
 Lottie (`.was`) stickers received from WhatsApp also play here; sending
 and favoriting `.was` require native wire-format support and are not offered.
+||||||| ccac2c45
+Click a sticker to send it. Animated stickers play on hover.
+=======
+Click a sticker to send it; the picker stays open for the next one. Animated stickers play on hover.
+>>>>>>> origin/main
 
 **Recent** holds the stickers you sent, not the ones you received.
 Right-click one to take it out of Recent here and on your phone. A sticker
@@ -749,16 +743,6 @@ follows it there when it was already at or near the top. Scrolled further down,
 working through older chats, the list keeps your place.
 Under the **Favorites** chip, the list keeps the phone's order and stays in place.
 
-To look up a new number, open **New chat → Add contact**, enter the full number
-with its country code, and click **Check number**. ZapFast asks WhatsApp whether
-it is registered and shows an available profile photo and name before you send
-anything. A known contact name or a business name returned by WhatsApp can appear;
-this lookup cannot fetch every person's personal profile name. Private or missing
-photos use initials instead. Failed checks offer a retry rather than claiming the
-number is unregistered. Checking alone does not save a contact or open a chat.
-Click **Message** to open the chat without saving, or enter a name and choose
-**Save contact**. The preview belongs to the account that requested it.
-
 While you scroll through a conversation, the day of the first message on screen
 stays at the top of the transcript, and fades away a moment after you stop.
 
@@ -985,21 +969,6 @@ launcher's right-click menu (KDE Plasma's task manager and application menu,
 GNOME's Dash). On every platform, `zapfast quit` in a terminal or a script quits
 the running copy the same way, and does nothing when none runs. A copy from
 before this command is left running, and the command says so and fails.
-
-### Xfce
-
-ZapFast uses Linux StatusNotifier tray icons, supported by Xfce's built-in
-**Status Tray Plugin** in Xfce 4.16 and later. Right-click the panel, open
-**Panel → Panel Preferences → Items**, and add **Status Tray Plugin** if it
-is missing. Open its properties and make sure ZapFast is not marked hidden
-under **Status Notifiers**. The separate `xfce4-statusnotifier-plugin` is
-[deprecated because its functionality is built into the panel](https://docs.xfce.org/panel-plugins/xfce4-statusnotifier-plugin/start).
-Adding or restoring the tray while ZapFast is running should register the icon
-automatically. This does not require changing ZapFast's package or installing
-the deprecated plugin.
-
-### Badges and notifications
-
 With several numbers linked, a notification's title also names the number it
 came to. The tray icon shows how many chats are unread, up to 9+. It is white on a dark
 panel and black on a light one: on Windows it follows the taskbar, and on Linux

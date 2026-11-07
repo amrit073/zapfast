@@ -4701,13 +4701,6 @@ impl App {
                     }
                 }
             }
-            Event::ContactLookupResult { request, result } => {
-                if let Some(lookup) = self.contact_lookup.as_mut()
-                    && lookup.request == request
-                {
-                    lookup.result = Some(result);
-                }
-            }
             Event::ContactReady { request, id, name } => {
                 if self.new_contact_request != Some(request) {
                     return;
@@ -5999,9 +5992,6 @@ impl App {
     }
 
     fn ensure_loaded(&mut self, chat: &str) {
-        self.backend.send(Command::SubscribePresence {
-            chat: chat.to_owned(),
-        });
         let request = {
             let conversation = self.conversations.entry(chat.to_owned()).or_default();
             if conversation.requested {
@@ -9095,15 +9085,9 @@ impl App {
                     });
                 }
                 if dialog == Dialog::PairWithPhone {
-                    self.pair_phone = match &self.link {
-                        LinkStatus::Unlinked { pairing_phone, .. } => {
-                            pairing_phone.clone().unwrap_or_default()
-                        }
-                        _ => String::new(),
-                    };
+                    self.pair_phone.clear();
                 }
                 if dialog == Dialog::NewContact {
-                    self.contact_lookup = None;
                     self.new_contact_to_phone = self.account().settings.save_contacts_to_phone;
                     self.new_contact_phone.clear();
                     self.new_contact_name.clear();
@@ -9116,7 +9100,6 @@ impl App {
                 self.dialog = Some(dialog);
             }
             Action::CloseDialog => {
-                self.contact_lookup = None;
                 if matches!(self.dialog, Some(Dialog::ExportChat { .. }))
                     && self.chat_export.is_some()
                 {
@@ -9162,19 +9145,6 @@ impl App {
                     first_name,
                     to_phone: self.account().settings.save_contacts_to_phone,
                 });
-            }
-            Action::LookupContact(phone) => {
-                if !(7..=15).contains(&phone.len()) || !phone.bytes().all(|b| b.is_ascii_digit()) {
-                    return;
-                }
-                self.contact_lookup_generation = self.contact_lookup_generation.wrapping_add(1);
-                let request = self.contact_lookup_generation;
-                self.contact_lookup = Some(crate::model::ContactLookup {
-                    request,
-                    phone: phone.clone(),
-                    result: None,
-                });
-                self.backend.send(Command::LookupContact { request, phone });
             }
             Action::NewContact {
                 phone,
@@ -9932,36 +9902,12 @@ impl App {
                 self.mark_settings_dirty();
             }
             Action::PairWithPhone(phone) => {
-                if self.link.is_connected()
-                    || matches!(
-                        &self.link,
-                        LinkStatus::Unlinked {
-                            pairing_phone: Some(_),
-                            pair_code: None,
-                            ..
-                        }
-                    )
-                {
-                    return;
-                }
                 let digits: String = phone.chars().filter(char::is_ascii_digit).collect();
-                if !crate::backend::valid_pair_phone(&digits) {
-                    self.toast_error("Enter the whole phone number with its country code, without a leading zero.");
+                if digits.len() < 7 {
+                    self.toast_error(
+                        "Enter the phone number with its country code, using digits only",
+                    );
                 } else {
-                    // Close immediately and mark the request before the next frame,
-                    // so a double click or repeated Enter cannot replace it.
-                    if self.dialog == Some(Dialog::PairWithPhone) {
-                        self.dialog = None;
-                    }
-                    let qr = match &self.link {
-                        LinkStatus::Unlinked { qr, .. } => qr.clone(),
-                        _ => None,
-                    };
-                    self.link = LinkStatus::Unlinked {
-                        qr,
-                        pair_code: None,
-                        pairing_phone: Some(digits.clone()),
-                    };
                     self.backend.send(Command::PairWithPhone(digits));
                 }
             }
@@ -15948,133 +15894,6 @@ mod tests {
     }
 
     #[test]
-    fn phone_pairing_closes_the_dialog_and_submits_only_once() {
-        let mut app = app();
-        let (backend, mut commands) = Backend::recording();
-        app.backend = backend;
-        let ctx = egui::Context::default();
-        app.link = LinkStatus::Unlinked {
-            qr: Some("synthetic".into()),
-            pair_code: None,
-            pairing_phone: None,
-        };
-        app.apply(Action::ShowDialog(Dialog::PairWithPhone), &ctx);
-        app.apply(Action::PairWithPhone("+1 555 000 1111".into()), &ctx);
-        app.apply(Action::PairWithPhone("15550001111".into()), &ctx);
-        assert!(app.dialog.is_none());
-        assert!(
-            matches!(commands.try_recv().unwrap(), Command::PairWithPhone(phone) if phone == "15550001111")
-        );
-        assert!(commands.try_recv().is_err());
-        app.link = LinkStatus::Unlinked {
-            qr: None,
-            pair_code: Some("ABCD1234".into()),
-            pairing_phone: Some("15550001111".into()),
-        };
-        app.apply(Action::ShowDialog(Dialog::PairWithPhone), &ctx);
-        assert_eq!(app.pair_phone, "15550001111");
-        app.apply(Action::CloseDialog, &ctx);
-        assert!(
-            matches!(&app.link, LinkStatus::Unlinked { pair_code: Some(code), .. } if code == "ABCD1234")
-        );
-        assert!(commands.try_recv().is_err());
-        app.apply(Action::PairWithPhone("015550001111".into()), &ctx);
-        assert!(commands.try_recv().is_err());
-    }
-
-    #[test]
-    fn contact_preview_ignores_replaced_and_closed_requests_without_opening_or_saving() {
-        let mut app = app();
-        let (backend, mut commands, events) = Backend::recording_with_events();
-        app.backend = backend;
-        let ctx = egui::Context::default();
-        app.apply(Action::ShowDialog(Dialog::NewContact), &ctx);
-        app.apply(Action::LookupContact("15551234567".into()), &ctx);
-        let first = app.contact_lookup.as_ref().unwrap().request;
-        app.apply(Action::LookupContact("15557654321".into()), &ctx);
-        let second = app.contact_lookup.as_ref().unwrap().request;
-        events
-            .send(Event::ContactLookupResult {
-                request: first,
-                result: Ok(None),
-            })
-            .unwrap();
-        app.handle_events();
-        assert!(app.contact_lookup.as_ref().unwrap().result.is_none());
-        let preview = crate::model::ContactPreview {
-            id: "15557654321@s.whatsapp.net".into(),
-            name: None,
-        };
-        events
-            .send(Event::ContactLookupResult {
-                request: second,
-                result: Ok(Some(preview.clone())),
-            })
-            .unwrap();
-        app.handle_events();
-        assert_eq!(
-            app.contact_lookup.as_ref().unwrap().result,
-            Some(Ok(Some(preview)))
-        );
-        assert!(app.open_chat.is_none());
-        assert!(app.contacts.is_empty());
-        assert!(app.actions.is_empty());
-        assert!(
-            std::iter::from_fn(|| commands.try_recv().ok())
-                .all(|c| matches!(c, Command::LookupContact { .. }))
-        );
-        app.apply(Action::CloseDialog, &ctx);
-        events
-            .send(Event::ContactLookupResult {
-                request: second,
-                result: Ok(None),
-            })
-            .unwrap();
-        app.handle_events();
-        assert!(app.contact_lookup.is_none());
-        app.apply(Action::ShowDialog(Dialog::NewContact), &ctx);
-        app.apply(Action::LookupContact("15557654321".into()), &ctx);
-        assert_ne!(app.contact_lookup.as_ref().unwrap().request, second);
-    }
-
-    #[test]
-    fn contact_preview_results_stay_with_the_originating_account() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut app, _) = two_accounts(directory.path());
-        let (backend, _, events) = Backend::recording_with_events();
-        app.accounts[1].backend = backend;
-        for account in &mut app.accounts {
-            account.contact_lookup = Some(crate::model::ContactLookup {
-                request: 1,
-                phone: "15551234567".into(),
-                result: None,
-            });
-        }
-        app.active = 0;
-        events
-            .send(Event::ContactLookupResult {
-                request: 1,
-                result: Err("Lookup timed out".into()),
-            })
-            .unwrap();
-        app.handle_events();
-        assert!(
-            app.accounts[0]
-                .contact_lookup
-                .as_ref()
-                .unwrap()
-                .result
-                .is_none()
-        );
-        assert!(matches!(
-            app.accounts[1].contact_lookup.as_ref().unwrap().result,
-            Some(Err(_))
-        ));
-        assert_eq!(app.active, 0);
-        assert!(app.actions.is_empty());
-    }
-
-    #[test]
     fn the_new_contact_box_remembers_whether_to_save_to_the_phone() {
         let mut app = app();
         let (backend, mut commands) = Backend::recording();
@@ -20088,43 +19907,6 @@ mod tests {
             &egui::Context::default(),
         );
         assert!(app.chat("3@s.whatsapp.net").unwrap().pinned);
-    }
-
-    #[test]
-    fn cached_chat_presence_refreshes_on_reopening_and_reconnecting() {
-        let mut app = app();
-        let (backend, mut commands) = Backend::recording();
-        app.backend = backend;
-        let chat = "15550100001@s.whatsapp.net";
-        app.open_chat = Some(chat.into());
-        app.ensure_loaded(chat);
-        assert!(
-            matches!(commands.try_recv().unwrap(), Command::SubscribePresence { chat: id } if id == chat)
-        );
-        assert!(matches!(
-            commands.try_recv().unwrap(),
-            Command::LoadChat { before: None, .. }
-        ));
-        assert!(matches!(commands.try_recv().unwrap(), Command::LoadPins(id) if id == chat));
-        // The archive page is cached, but a failed presence send must be retried.
-        app.ensure_loaded(chat);
-        assert!(
-            matches!(commands.try_recv().unwrap(), Command::SubscribePresence { chat: id } if id == chat)
-        );
-        assert!(commands.try_recv().is_err());
-        app.handle_link(
-            LinkStatus::Disconnected {
-                reason: "fixture".into(),
-            },
-            true,
-        );
-        app.handle_link(LinkStatus::Connected, true);
-        let refreshed = std::iter::from_fn(|| commands.try_recv().ok())
-            .filter(
-                |command| matches!(command, Command::SubscribePresence { chat: id } if id == chat),
-            )
-            .count();
-        assert_eq!(refreshed, 1);
     }
 
     #[test]

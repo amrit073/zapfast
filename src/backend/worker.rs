@@ -21,6 +21,7 @@ use whatsapp_rust::media::{
     image_message, video_message,
 };
 use whatsapp_rust::pair::NATIVE_CAMERA_DEEP_LINK_PREFIX;
+use whatsapp_rust::pair_code::PairCodeOptions;
 use whatsapp_rust::prelude::{
     Bot, BotHandle, Client, Jid, MessageBuilderExt, MessageExt, MessageField, SendOptions, wa,
 };
@@ -48,7 +49,6 @@ mod device_store;
 mod disappearing;
 mod download_folders;
 mod early_events;
-mod phone_pairing;
 use early_events::WaitingReaction;
 mod favorite_chats;
 mod group_admin;
@@ -1007,7 +1007,6 @@ pub async fn run(
         status: LinkStatus::Starting,
         pairing_phone: None,
         pair_code: None,
-        pair_request: None,
         qr: None,
         syncing: false,
         sync_deadline: None,
@@ -1023,6 +1022,7 @@ pub async fn run(
         group_info_queue: std::collections::VecDeque::new(),
         group_info_tries: HashMap::new(),
         group_info_retry: Vec::new(),
+        presence_subscribed: HashSet::new(),
         download_folder: None,
         cleaned_download_folders: HashSet::new(),
         keep_chats_archived: true,
@@ -1166,7 +1166,6 @@ pub async fn run(
                 RuntimeEvent::WhatsApp { session, event } => {
                     worker.whatsapp_event(session, event).await;
                 }
-                RuntimeEvent::PairCode { request, result } => worker.finish_pair_code(request, result),
                 RuntimeEvent::MessageRemoval { generation, event } => {
                     worker.handle_session_deletion(generation, event).await;
                 }
@@ -1238,11 +1237,6 @@ pub async fn run(
 }
 
 enum RuntimeEvent {
-    // Keep completion behind the library events it emitted on the same FIFO.
-    PairCode {
-        request: u64,
-        result: Result<String, String>,
-    },
     /// A callback from a connection's event handler, under the session that
     /// started it.
     WhatsApp {
@@ -1521,7 +1515,6 @@ struct Worker {
     status: LinkStatus,
     pairing_phone: Option<String>,
     pair_code: Option<String>,
-    pair_request: Option<(u64, tokio::task::JoinHandle<()>)>,
     qr: Option<String>,
     syncing: bool,
     sync_deadline: Option<Instant>,
@@ -1564,6 +1557,7 @@ struct Worker {
     group_info_tries: HashMap<String, u32>,
     /// Next retry time for failed group metadata requests.
     group_info_retry: Vec<(Instant, String)>,
+    presence_subscribed: HashSet<String>,
     /// Chosen folder for new downloads, when not the cache.
     download_folder: Option<PathBuf>,
     /// Clean each chosen root once, before this worker can start downloads there.
@@ -3438,7 +3432,6 @@ impl Worker {
     }
 
     async fn stop_bot(&mut self) {
-        self.stop_pair_request();
         self.blocklist.invalidate();
         self.client = None;
         // A batch still going belongs to the session that was sending it, and
@@ -4060,34 +4053,26 @@ impl Worker {
                 let status = self.unlinked();
                 self.set_status(status);
             }
-            // Direct requests return through the correlated PairCode runtime event.
-            // The library also emits this event; accepting both could revive
-            // a cancelled request or overwrite a newer code.
-            E::PairingCode(_) => {}
-            E::PairingCodeError(error) => {
-                if self.pair_request.is_none() && self.pairing_phone.is_some() {
-                    self.pair_code = None;
-                    self.pairing_phone = None;
-                    self.emit(Event::Error(format!(
-                        "Could not link by phone number: {}",
-                        error.error
-                    )));
-                    if self.qr.is_none() {
-                        let _ = self.commands.send(Command::Relink);
-                    }
-                    let status = self.unlinked();
-                    self.set_status(status);
-                }
+            E::PairingCode(code) => {
+                self.pair_code = Some(code.code.clone());
+                let status = self.unlinked();
+                self.set_status(status);
             }
-            E::PairingCodeRefresh(_) => {
-                if self.pair_request.is_none() && self.pair_code.is_some() {
-                    self.pair_code = None;
-                    self.pairing_phone = None;
-                    self.emit(Event::Info(
-                        "The phone-linking code is no longer valid. Request another code.".into(),
-                    ));
-                    let status = self.unlinked();
-                    self.set_status(status);
+            E::PairingCodeError(error) => {
+                self.pair_code = None;
+                self.pairing_phone = None;
+                self.emit(Event::Error(format!(
+                    "Could not link by phone number: {}",
+                    error.error
+                )));
+                let status = self.unlinked();
+                self.set_status(status);
+                // A failed phone-number request can be the last thing that
+                // connection does: its QR refs may already be spent, which
+                // leaves nothing to show and no code to scan. A fresh client
+                // brings the QR screen back instead of an empty spinner.
+                if self.qr.is_none() {
+                    let _ = self.commands.send(Command::Relink);
                 }
             }
             E::PairingQrCodesExhausted(exhausted) => {
@@ -4105,7 +4090,6 @@ impl Worker {
                 }
             }
             E::PairSuccess(pair) => {
-                self.stop_pair_request();
                 self.qr = None;
                 self.pair_code = None;
                 self.pairing_phone = None;
@@ -4113,7 +4097,6 @@ impl Worker {
                 self.set_status(LinkStatus::Connecting);
             }
             E::Connected(_) => {
-                self.stop_pair_request();
                 let (pn, lid, name) = match &self.client {
                     Some(client) => (client.pn(), client.lid(), Some(client.push_name())),
                     None => (None, None, None),
@@ -4693,6 +4676,7 @@ impl Worker {
         self.group_info_queue.clear();
         self.group_info_tries.clear();
         self.group_info_retry.clear();
+        self.presence_subscribed.clear();
         self.read_sync = ReadSync::default();
         self.favorite_chats = Default::default();
         self.poll_sending.clear();
@@ -7385,7 +7369,6 @@ impl Worker {
                     self.pump_read_sync();
                 }
             }
-            Command::SubscribePresence { chat } => self.subscribe_presence(chat),
             Command::LoadChat { chat, before } => self.load_chat(chat, before),
             Command::SetChatExportAllowed(allowed) => {
                 self.chat_export.allowed = allowed;
@@ -8157,59 +8140,6 @@ impl Worker {
                 self.emit(Event::Info(format!("Added {name} to contacts")));
                 self.emit_chat(&id);
             }
-            Command::LookupContact { request, phone } => {
-                let Some(client) = self.client.clone().filter(|_| self.status.is_connected())
-                else {
-                    self.emit(Event::ContactLookupResult {
-                        request,
-                        result: Err("Connect to WhatsApp to check this number.".into()),
-                    });
-                    return;
-                };
-                let commands = self.commands.clone();
-                tokio::spawn(async move {
-                    let lookup = async {
-                        let results = client
-                            .contacts()
-                            .is_on_whatsapp(&[Jid::pn(&phone)])
-                            .await
-                            .map_err(|_| "Could not check this number. Try again.".to_owned())?;
-                        let entry = results.into_iter().next().ok_or_else(|| {
-                            "WhatsApp did not return a result. Try again.".to_owned()
-                        })?;
-                        if entry.contact_error.is_some() {
-                            return Err("Could not check this number. Try again.".into());
-                        }
-                        Ok(entry.is_registered.then(|| crate::model::ContactPreview {
-                            id: format!("{phone}@s.whatsapp.net"),
-                            name: entry
-                                .verified_name
-                                .and_then(|name| name.name)
-                                .filter(|name| !name.trim().is_empty()),
-                        }))
-                    };
-                    let result = tokio::time::timeout(Duration::from_secs(15), lookup)
-                        .await
-                        .unwrap_or_else(|_| Err("Number lookup timed out. Try again.".into()));
-                    let _ = commands.send(Command::ContactLookupResult { request, result });
-                });
-            }
-            Command::ContactLookupResult {
-                request,
-                mut result,
-            } => {
-                if let Ok(Some(preview)) = &mut result {
-                    if let Ok(jid) = preview.id.parse::<Jid>() {
-                        preview.id = self.canonical(&jid);
-                    }
-                    if let Ok(Some(contact)) = self.archive.contact(&preview.id)
-                        && let Some(name) = contact.display_name()
-                    {
-                        preview.name = Some(name.to_owned());
-                    }
-                }
-                self.emit(Event::ContactLookupResult { request, result });
-            }
             Command::NewContact {
                 request,
                 phone,
@@ -8871,7 +8801,42 @@ impl Worker {
                     .map_err(|error| error.to_string())
                 });
             }
-            Command::PairWithPhone(phone) => self.request_pair_code(phone),
+            Command::PairWithPhone(phone) => {
+                let Some(client) = self.client.clone() else {
+                    self.emit(Event::Error("Not connected to WhatsApp yet".to_owned()));
+                    return;
+                };
+                self.pairing_phone = Some(phone.clone());
+                self.pair_code = None;
+                let status = self.unlinked();
+                self.set_status(status);
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let result = client
+                        .pair_with_code(PairCodeOptions {
+                            phone_number: phone,
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = commands.send(Command::PairCode { result });
+                });
+            }
+            Command::PairCode { result } => match result {
+                Ok(code) => {
+                    self.pair_code = Some(code);
+                    let status = self.unlinked();
+                    self.set_status(status);
+                }
+                Err(error) => {
+                    self.pairing_phone = None;
+                    self.emit(Event::Error(format!(
+                        "Could not link by phone number: {error}"
+                    )));
+                    let status = self.unlinked();
+                    self.set_status(status);
+                }
+            },
             Command::Unlink => {
                 if let Some(client) = self.client.clone() {
                     // The logged-out event clears this side either way; a
@@ -10164,21 +10129,15 @@ impl Worker {
             // Force group metadata when opening a group.
             self.request_group_info(&chat, false);
         }
-    }
-
-    fn subscribe_presence(&self, chat: ChatId) {
-        // The protocol library tracks successful subscriptions and restores
-        // them after reconnecting. Refresh when opening even a cached chat:
-        // a failed send (or an earlier attempt before connecting) must not
-        // permanently suppress future requests.
-        if ChatKind::from_id(&chat) == ChatKind::Direct
+        if before.is_none()
+            && ChatKind::from_id(&chat) == ChatKind::Direct
             && chat != self.me()
-            && matches!(self.status, LinkStatus::Connected)
+            && self.presence_subscribed.insert(chat.clone())
             && let (Some(client), Some(jid)) = (self.client.clone(), Self::jid_of(&chat))
         {
             tokio::spawn(async move {
-                if client.presence().subscribe(jid).await.is_err() {
-                    log::debug!("presence subscription failed; retry on opening or reconnecting");
+                if let Err(error) = client.presence().subscribe(jid).await {
+                    log::debug!("presence not subscribed: {error}");
                 }
             });
         }
@@ -20111,7 +20070,6 @@ mod receipt_tests {
             status: LinkStatus::Connected,
             pairing_phone: None,
             pair_code: None,
-            pair_request: None,
             qr: None,
             syncing: false,
             sync_deadline: None,
@@ -20127,6 +20085,7 @@ mod receipt_tests {
             group_info_queue: std::collections::VecDeque::new(),
             group_info_tries: HashMap::new(),
             group_info_retry: Vec::new(),
+            presence_subscribed: HashSet::new(),
             download_folder: None,
             cleaned_download_folders: HashSet::new(),
             keep_chats_archived: true,

@@ -11887,41 +11887,6 @@ mod tests {
     }
 
     #[test]
-    fn contact_subtitle_uses_only_server_provided_presence() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut app, _) = App::headless(
-            crate::paths::AppDirs::under(directory.path()),
-            crate::settings::Settings::default(),
-        );
-        let mut chat = Chat::new("15550100001@s.whatsapp.net".into(), "Ada".into());
-        chat.last_activity = 1_700_000_000;
-        let baseline = subtitle(&app, &chat).0;
-        assert!(!baseline.contains("last seen"));
-        app.presence.insert(
-            chat.id.clone(),
-            crate::app::Presence {
-                online: false,
-                last_seen: Some(1_700_000_000),
-            },
-        );
-        assert_eq!(
-            subtitle(&app, &chat).0,
-            crate::util::last_seen(app.locale, 1_700_000_000)
-        );
-        app.presence.get_mut(&chat.id).unwrap().online = true;
-        assert_eq!(subtitle(&app, &chat).0, "online");
-        // A privacy-restricted response must not keep a previous timestamp.
-        app.presence.insert(
-            chat.id.clone(),
-            crate::app::Presence {
-                online: false,
-                last_seen: None,
-            },
-        );
-        assert_eq!(subtitle(&app, &chat).0, baseline);
-    }
-
-    #[test]
     fn account_read_receipt_privacy_hides_read_ticks_only_in_outgoing_dms() {
         use crate::model::ChatKind;
 

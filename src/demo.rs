@@ -980,13 +980,6 @@ pub fn populate(app: &mut App) {
             last_seen: None,
         },
     );
-    app.presence.insert(
-        SAMPLES[2].id.to_owned(),
-        Presence {
-            online: false,
-            last_seen: Some(crate::util::now() - 300),
-        },
-    );
     app.open_chat = Some(ada.to_owned());
     // Mark the open chat as read.
     if let Some(chat) = app.chats.iter_mut().find(|chat| chat.id == ada) {
@@ -2027,7 +2020,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
         match part {
             "history-date" => history_date_sample(app),
             "chat" | "" => {}
-            "last-seen" => app.open_chat = Some(SAMPLES[2].id.to_owned()),
             "blocked" | "blocked-contacts" | "block-confirm" => {
                 app.blocklist.ids = Some(if part == "block-confirm" {
                     Default::default()
@@ -3278,18 +3270,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     });
                 }
             }
-            "contact-preview" => {
-                app.dialog = Some(Dialog::NewContact);
-                app.new_contact_phone = crate::model::phone_of(SAMPLES[2].id).unwrap().into();
-                app.contact_lookup = Some(crate::model::ContactLookup {
-                    request: 1,
-                    phone: app.new_contact_phone.clone(),
-                    result: Some(Ok(Some(crate::model::ContactPreview {
-                        id: SAMPLES[2].id.into(),
-                        name: Some("Grace Hopper".into()),
-                    }))),
-                });
-            }
             "new-contact" => app.dialog = Some(Dialog::NewContact),
             // A formatted number with no name: the dialog offers Message.
             "new-contact-number" => {
@@ -3356,11 +3336,11 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     pairing_phone: None,
                 };
             }
-            "pair" | "pair-requesting" => {
+            "pair" => {
                 unlink(app);
                 app.link = LinkStatus::Unlinked {
                     qr: None,
-                    pair_code: (part == "pair").then(|| "FWAP1234".into()),
+                    pair_code: Some("FWAP1234".into()),
                     pairing_phone: Some("15550001111".into()),
                 };
             }
@@ -9781,7 +9761,6 @@ mod tests {
             "remove-pack",
             "delete-selection",
             "select-delete",
-            "contact-preview",
             "new-contact",
             "accounts",
             "accounts,light",
@@ -9812,7 +9791,6 @@ mod tests {
             "sticker-pack-message",
             "sticker-maker",
             "sticker-pack-view",
-            "last-seen",
             "typing",
             "composer-tools",
             "link-preview",
@@ -9895,7 +9873,7 @@ mod tests {
             apply_flags(&mut app, Some(page));
             render(&mut app, &ctx);
         }
-        for page in ["login", "pair", "pair-requesting", "phone"] {
+        for page in ["login", "pair", "phone"] {
             let mut app = self::app();
             apply_flags(&mut app, Some(page));
             render(&mut app, &ctx);
@@ -20734,37 +20712,6 @@ mod tests {
             .unwrap_or_else(|| panic!("no {label} button"))
             .1
             .is_disabled()
-    }
-
-    #[test]
-    fn contact_preview_displays_results_and_hides_them_when_the_number_changes() {
-        let mut app = app();
-        let ctx = egui::Context::default();
-        apply_flags(&mut app, Some("contact-preview"));
-        app.attach(&ctx);
-        assert!(
-            accessible_labels(&mut app, &ctx)
-                .iter()
-                .any(|s| s == "On WhatsApp")
-        );
-        app.new_contact_phone = "15550009999".into();
-        assert!(
-            !accessible_labels(&mut app, &ctx)
-                .iter()
-                .any(|s| s == "On WhatsApp")
-        );
-        app.new_contact_phone = app.contact_lookup.as_ref().unwrap().phone.clone();
-        for (result, text) in [
-            (Some(Ok(None)), "This number is not on WhatsApp."),
-            (
-                Some(Err("Could not check this number. Try again.".into())),
-                "Could not check this number. Try again.",
-            ),
-            (None, "Checking the number…"),
-        ] {
-            app.contact_lookup.as_mut().unwrap().result = result;
-            assert!(accessible_labels(&mut app, &ctx).iter().any(|s| s == text));
-        }
     }
 
     /// A button that cannot act yet must say so, on screen and to screen

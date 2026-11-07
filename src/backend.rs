@@ -33,13 +33,6 @@ pub enum MessageRemovalOutcome {
     Uncertain,
 }
 
-/// Validate an international number before replacing an existing pairing flow.
-pub fn valid_pair_phone(phone: &str) -> bool {
-    (7..=15).contains(&phone.len())
-        && !phone.starts_with('0')
-        && phone.bytes().all(|byte| byte.is_ascii_digit())
-}
-
 /// Phone-link state.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinkStatus {
@@ -290,10 +283,6 @@ pub enum Command {
         chat: ChatId,
         marked_at: i64,
         success: bool,
-    },
-    /// Refreshes a direct contact's server-provided online and last-seen state.
-    SubscribePresence {
-        chat: ChatId,
     },
     /// Loads archived chat messages before an optional boundary.
     LoadChat {
@@ -878,15 +867,6 @@ pub enum Command {
         first_name: Option<String>,
         error: Option<String>,
     },
-    /// Checks a number without saving or opening a chat.
-    LookupContact {
-        request: u64,
-        phone: String,
-    },
-    ContactLookupResult {
-        request: u64,
-        result: Result<Option<crate::model::ContactPreview>, String>,
-    },
     /// Checks a number, optionally saves it, and opens its chat.
     NewContact {
         request: u64,
@@ -1134,6 +1114,10 @@ pub enum Command {
         /// for. A snapshot older than a permission or member change made here
         /// cannot undo it.
         settings_generation: u64,
+    },
+    /// Internal pairing-code result.
+    PairCode {
+        result: Result<String, String>,
     },
     /// Internal account read-receipt setting.
     ReceiptsPrivacy {
@@ -1558,11 +1542,6 @@ pub enum Event {
     ContactFailed {
         request: u64,
         error: String,
-    },
-    /// Result of a preview-only number lookup.
-    ContactLookupResult {
-        request: u64,
-        result: Result<Option<crate::model::ContactPreview>, String>,
     },
     /// Number lookup succeeded and its chat can open.
     ContactReady {

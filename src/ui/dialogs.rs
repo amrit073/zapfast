@@ -1805,7 +1805,7 @@ fn pair_with_phone(app: &mut App, ui: &mut egui::Ui) {
         ui,
         crate::i18n::gettext(
             app.locale,
-            "Enter the WhatsApp phone number with its country code. Do not include a plus sign or leading zero. Requesting a new code replaces the previous one.",
+            "Enter the WhatsApp phone number with its country code. Do not include a plus sign or leading zero. You will get a code to enter on the phone.",
         ),
         theme::regular(13.0),
         palette.secondary,
@@ -1849,12 +1849,7 @@ fn pair_with_phone(app: &mut App, ui: &mut egui::Ui) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let digits: String = app
-                .pair_phone
-                .chars()
-                .filter(char::is_ascii_digit)
-                .collect();
-            let ready = crate::backend::valid_pair_phone(&digits);
+            let ready = app.pair_phone.chars().filter(char::is_ascii_digit).count() >= 7;
             // Stay the main action, but look and read as unavailable until
             // the number is long enough.
             let hint = crate::i18n::gettext(
@@ -2002,72 +1997,9 @@ fn new_contact(app: &mut App, ui: &mut egui::Ui) {
             (first, last)
         })
         .inner;
+    // A leading plus, spaces, hyphens and brackets are formatting; anything
+    // else (an extension, a letter) would change the number, so it is refused.
     let digits = crate::util::international_phone(&app.new_contact_phone).unwrap_or_default();
-    let lookup = app
-        .contact_lookup
-        .clone()
-        .filter(|lookup| lookup.phone == digits);
-    let checking = lookup
-        .as_ref()
-        .is_some_and(|lookup| lookup.result.is_none());
-    ui.add_space(6.0);
-    let check = ui
-        .add_enabled_ui((7..=15).contains(&digits.len()) && !checking, |ui| {
-            theme::pill_button(ui, &palette, "Check number", false)
-        })
-        .inner;
-    if check.clicked() {
-        app.actions.push(Action::LookupContact(digits.clone()));
-    }
-    if let Some(lookup) = lookup {
-        match lookup.result {
-            None => {
-                theme::text(
-                    ui,
-                    "Checking the number…",
-                    theme::regular(13.0),
-                    palette.secondary,
-                );
-            }
-            Some(Err(error)) => {
-                theme::paragraph(ui, &error, theme::regular(13.0), palette.secondary);
-            }
-            Some(Ok(None)) => {
-                theme::text(
-                    ui,
-                    "This number is not on WhatsApp.",
-                    theme::regular(13.0),
-                    palette.secondary,
-                );
-            }
-            Some(Ok(Some(preview))) => {
-                let name = preview
-                    .name
-                    .unwrap_or_else(|| crate::util::phone(&preview.id));
-                let picture = app.avatar(&preview.id);
-                ui.horizontal(|ui| {
-                    super::widgets::avatar(
-                        ui,
-                        &palette,
-                        &name,
-                        &preview.id,
-                        44.0,
-                        picture.as_deref(),
-                    );
-                    ui.vertical(|ui| {
-                        theme::text(ui, &name, theme::semibold(14.0), palette.text);
-                        theme::text(ui, "On WhatsApp", theme::regular(12.5), palette.secondary);
-                    });
-                });
-                theme::paragraph(
-                    ui,
-                    "Names and photos are shown when available. A private photo may not appear.",
-                    theme::regular(12.0),
-                    palette.secondary,
-                );
-            }
-        }
-    }
     let ready = !digits.is_empty() && !app.new_contact_pending;
     let named = !app.new_contact_name.trim().is_empty() || !app.new_contact_last.trim().is_empty();
     let submitted =

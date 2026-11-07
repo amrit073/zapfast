@@ -1992,20 +1992,6 @@ pub struct Contact {
     pub push_name: Option<String>,
 }
 
-/// A number lookup is transient and never saves a contact by itself.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ContactPreview {
-    pub id: ChatId,
-    pub name: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ContactLookup {
-    pub request: u64,
-    pub phone: String,
-    pub result: Option<Result<Option<ContactPreview>, String>>,
-}
-
 impl Contact {
     pub fn display_name(&self) -> Option<&str> {
         self.full_name
@@ -3153,7 +3139,6 @@ pub enum Action {
     /// Checks a number, optionally saves it, and opens its chat.
     /// `to_phone` is the dialog's "Save to phone" choice; `None` uses the
     /// last one.
-    LookupContact(String),
     NewContact {
         phone: String,
         first: String,

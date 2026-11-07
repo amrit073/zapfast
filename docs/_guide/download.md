@@ -188,21 +188,3 @@ offer no usable OpenGL, and Windows then shows a message instead of starting.
 
 SmartScreen may warn about an unknown publisher on first run. Choose **More
 info**, then **Run anyway**.
-
-## Personal Arch Linux build
-
-In this fork, open **Releases** and select the newest **Arch Linux build**
-prerelease. Under **Assets**, download the `.pkg.tar.zst` and `checksums.txt`
-into the same folder. Release downloads do not have the Actions artifact
-30-day expiry.
-
-On x86_64 Arch Linux, verify and install the package from that folder:
-
-```sh
-sha256sum --check checksums.txt
-sudo pacman -U ./zapfast-bin-*.pkg.tar.zst
-```
-
-Launch `zapfast` from your desktop menu or terminal. The package includes the
-current source changes and uses the same local account data as other ZapFast
-installations. The artifact's `BUILD.txt` identifies the source commit.
